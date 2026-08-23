@@ -41,6 +41,7 @@ export class Store {
     this.db.prepare('INSERT INTO projects VALUES (?, ?, ?)').run(id, name, createdAt);
     this.audit('project', id, 'created', actor, { name }); return { id, name, createdAt };
   }
+  projects() { return this.db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all(); }
   createTask(projectId: string, title: string, actor = 'system') {
     if (!this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId)) throw new DomainError('project not found', 'NOT_FOUND');
     const id = randomUUID(); const createdAt = this.now();
@@ -48,6 +49,10 @@ export class Store {
     this.audit('task', id, 'created', actor, { projectId, title }); return this.task(id);
   }
   task(id: string) { const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as RecordRow | undefined; if (!row) throw new DomainError('task not found', 'NOT_FOUND'); return row; }
+  tasks(projectId: string) {
+    if (!this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId)) throw new DomainError('project not found', 'NOT_FOUND');
+    return this.db.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC').all(projectId);
+  }
   createPlan(taskId: string, body: string, actor = 'system') {
     this.task(taskId); const id = randomUUID(); const createdAt = this.now();
     try { this.db.prepare('INSERT INTO plans (id, task_id, body, status, created_at) VALUES (?, ?, ?, ?, ?)').run(id, taskId, body, 'draft', createdAt); }
@@ -88,6 +93,15 @@ export class Store {
     this.transitionTask(String(execution.task_id), 'awaiting_acceptance', actor); this.audit('execution', id, 'finished', actor, {}); return this.execution(id);
   }
   execution(id: string) { const row = this.db.prepare('SELECT * FROM executions WHERE id=?').get(id) as RecordRow | undefined; if (!row) throw new DomainError('execution not found', 'NOT_FOUND'); return row; }
+  taskConsole(id: string) {
+    const task = this.task(id);
+    return {
+      task,
+      plan: this.db.prepare('SELECT * FROM plans WHERE task_id=?').get(id) ?? null,
+      executions: this.db.prepare('SELECT * FROM executions WHERE task_id=? ORDER BY created_at DESC').all(id),
+      audit: this.auditEvents(id)
+    };
+  }
   auditEvents(entityId?: string) { return this.db.prepare(entityId ? 'SELECT * FROM audit_events WHERE entity_id=? ORDER BY created_at' : 'SELECT * FROM audit_events ORDER BY created_at').all(...(entityId ? [entityId] : [])); }
   close() { this.db.close(); }
 }

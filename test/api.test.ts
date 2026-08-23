@@ -23,3 +23,25 @@ test('HTTP API completes the documented approval and execution loop', async () =
   assert.ok(events.length >= 4);
   await app.close();
 });
+
+test('console exposes project/task views and preserves execution approval constraint', async () => {
+  const app = buildServer(new Store());
+  const projectResponse = await app.inject({ method: 'POST', url: '/projects', payload: { name: 'console demo' } });
+  const project = JSON.parse(projectResponse.body) as Record<string, string>;
+  const taskResponse = await app.inject({ method: 'POST', url: `/projects/${project.id}/tasks`, payload: { title: 'review in browser' } });
+  const task = JSON.parse(taskResponse.body) as Record<string, string>;
+
+  const html = await app.inject({ method: 'GET', url: '/' });
+  assert.equal(html.statusCode, 200);
+  assert.match(html.body, /ATS MVP 控制台/);
+  const projects = await app.inject({ method: 'GET', url: '/projects' });
+  assert.equal(JSON.parse(projects.body)[0].name, 'console demo');
+  const tasks = await app.inject({ method: 'GET', url: `/projects/${project.id}/tasks` });
+  assert.equal(JSON.parse(tasks.body)[0].id, task.id);
+  const blocked = await app.inject({ method: 'POST', url: `/tasks/${task.id}/executions`, payload: { provider: 'noop' } });
+  assert.equal(blocked.statusCode, 422);
+  assert.match(blocked.body, /approved plan/);
+  const detail = await app.inject({ method: 'GET', url: `/tasks/${task.id}/console` });
+  assert.equal(JSON.parse(detail.body).task.status, 'planned');
+  await app.close();
+});
