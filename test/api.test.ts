@@ -16,6 +16,10 @@ test('HTTP API completes the documented approval and execution loop', async () =
   await json(`/plans/${plan.id}/approve`, { actor: 'reviewer' });
   const execution = await json(`/tasks/${task.id}/executions`, { provider: 'noop' });
   await json(`/executions/${execution.id}/finish`, {});
-  assert.equal((await json(`/tasks/${task.id}`)).status, 'awaiting_acceptance');
+  await json(`/tasks/${task.id}/accept`, { actor: 'reviewer' });
+  assert.equal((await json(`/tasks/${task.id}`)).status, 'accepted');
+  const events = await json(`/audit/${task.id}`);
+  assert.ok(Array.isArray(events));
+  assert.ok(events.length >= 4);
   await app.close();
 });

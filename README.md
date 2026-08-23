@@ -25,7 +25,11 @@ curl -sS -X POST http://127.0.0.1:3000/plans/$plan_id/approve -H 'content-type: 
 execution=$(curl -sS -X POST http://127.0.0.1:3000/tasks/$task_id/executions -H 'content-type: application/json' -d '{"provider":"noop"}')
 execution_id=$(node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id))' <<< "$execution")
 curl -sS -X POST http://127.0.0.1:3000/executions/$execution_id/finish -H 'content-type: application/json' -d '{}'
+curl -sS http://127.0.0.1:3000/audit/$task_id
+curl -sS -X POST http://127.0.0.1:3000/tasks/$task_id/accept -H 'content-type: application/json' -d '{"actor":"reviewer"}'
 curl -sS http://127.0.0.1:3000/tasks/$task_id
 ```
+
+最后一个响应的 `status` 应为 `accepted`。SQLite schema 会在服务首次启动时自动创建；如果 `ATS_DB` 指向不存在的父目录，服务也会自动创建该目录。
 
 验证：`npm test`、`npm run typecheck`。
