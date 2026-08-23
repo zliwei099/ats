@@ -20,6 +20,8 @@ type AuditEventRow = RecordRow & {
 
 export type EvidencePackage = {
   task: RecordRow;
+  dependencies: Array<RecordRow>;
+  blocked_dependents: Array<RecordRow>;
   plan: RecordRow | null;
   executions: Array<RecordRow & { started_by: string | null; finished_by: string | null }>;
   status_transitions: Array<{ event_id: string; from: string; to: string; actor: string; created_at: string }>;
@@ -48,6 +50,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS plans (id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id), body TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, created_at TEXT NOT NULL, decided_at TEXT);
       CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), provider TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT);
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_execution_per_task ON executions(task_id) WHERE status = 'active';
+      CREATE TABLE IF NOT EXISTS task_dependencies (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), depends_on_task_id TEXT NOT NULL REFERENCES tasks(id), created_at TEXT NOT NULL, resolved_at TEXT, UNIQUE(task_id, depends_on_task_id), CHECK(task_id <> depends_on_task_id));
+      CREATE INDEX IF NOT EXISTS task_dependencies_depends_on ON task_dependencies(depends_on_task_id);
       CREATE TABLE IF NOT EXISTS audit_events (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, actor TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL, sequence INTEGER);
     `);
     const columns = this.db.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
@@ -68,6 +72,40 @@ export class Store {
     const id = randomUUID(); const createdAt = this.now();
     this.db.prepare('INSERT INTO tasks VALUES (?, ?, ?, ?, ?)').run(id, projectId, title, 'planned', createdAt);
     this.audit('task', id, 'created', actor, { projectId, title }); return this.task(id);
+  }
+  addDependency(taskId: string, dependsOnTaskId: string, actor = 'system') {
+    const task = this.task(taskId); const prerequisite = this.task(dependsOnTaskId);
+    if (taskId === dependsOnTaskId) throw new DomainError('a task cannot depend on itself', 'INVALID_DEPENDENCY');
+    if (task.project_id !== prerequisite.project_id) throw new DomainError('dependencies must be in the same project', 'INVALID_DEPENDENCY');
+    const cycle = this.db.prepare(`WITH RECURSIVE reachable(id) AS (
+      SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?
+      UNION
+      SELECT dependency.depends_on_task_id FROM task_dependencies dependency JOIN reachable ON dependency.task_id = reachable.id
+    ) SELECT 1 FROM reachable WHERE id = ? LIMIT 1`).get(dependsOnTaskId, taskId);
+    if (cycle) throw new DomainError('dependency would create a cycle', 'INVALID_DEPENDENCY');
+    const id = randomUUID(); const createdAt = this.now();
+    try { this.db.prepare('INSERT INTO task_dependencies (id, task_id, depends_on_task_id, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)')
+      .run(id, taskId, dependsOnTaskId, createdAt, prerequisite.status === 'accepted' ? createdAt : null); }
+    catch { throw new DomainError('dependency already exists', 'CONFLICT'); }
+    this.audit('task', taskId, 'dependency_created', actor, { dependencyId: id, dependsOnTaskId });
+    if (prerequisite.status === 'accepted') this.audit('task', taskId, 'dependency_resolved', actor, { dependencyId: id, dependsOnTaskId });
+    return this.dependencies(taskId).find(dependency => dependency.id === id)!;
+  }
+  dependencies(taskId: string) {
+    this.task(taskId);
+    return this.db.prepare(`SELECT dependency.id, dependency.task_id, dependency.depends_on_task_id, dependency.created_at, dependency.resolved_at,
+      prerequisite.title AS depends_on_title, prerequisite.status AS depends_on_status,
+      CASE WHEN prerequisite.status = 'accepted' THEN 1 ELSE 0 END AS satisfied
+      FROM task_dependencies dependency JOIN tasks prerequisite ON prerequisite.id = dependency.depends_on_task_id
+      WHERE dependency.task_id = ? ORDER BY dependency.created_at, dependency.id`).all(taskId) as RecordRow[];
+  }
+  blockedDependents(taskId: string) {
+    this.task(taskId);
+    return this.db.prepare(`SELECT dependency.id, dependency.task_id, dependency.depends_on_task_id, dependency.created_at, dependency.resolved_at,
+      dependent.title AS task_title, dependent.status AS task_status,
+      CASE WHEN dependent.status = 'accepted' THEN 1 ELSE 0 END AS satisfied
+      FROM task_dependencies dependency JOIN tasks dependent ON dependent.id = dependency.task_id
+      WHERE dependency.depends_on_task_id = ? ORDER BY dependency.created_at, dependency.id`).all(taskId) as RecordRow[];
   }
   task(id: string) { const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as RecordRow | undefined; if (!row) throw new DomainError('task not found', 'NOT_FOUND'); return row; }
   tasks(status?: TaskStatus) {
@@ -95,12 +133,21 @@ export class Store {
   transitionTask(id: string, target: TaskStatus, actor = 'system') {
     const task = this.task(id); const current = task.status as TaskStatus;
     if (!transitions[current].includes(target)) throw new DomainError(`cannot transition task from ${current} to ${target}`, 'INVALID_STATE');
-    this.db.prepare('UPDATE tasks SET status=? WHERE id=?').run(target, id); this.audit('task', id, 'status_changed', actor, { from: current, to: target }); return this.task(id);
+    this.db.prepare('UPDATE tasks SET status=? WHERE id=?').run(target, id); this.audit('task', id, 'status_changed', actor, { from: current, to: target });
+    if (target === 'accepted') {
+      const unresolved = this.db.prepare('SELECT id, task_id FROM task_dependencies WHERE depends_on_task_id=? AND resolved_at IS NULL ORDER BY created_at, id').all(id) as Array<{ id: string; task_id: string }>;
+      const resolvedAt = this.now();
+      this.db.prepare('UPDATE task_dependencies SET resolved_at=? WHERE depends_on_task_id=? AND resolved_at IS NULL').run(resolvedAt, id);
+      for (const dependency of unresolved) this.audit('task', dependency.task_id, 'dependency_resolved', actor, { dependencyId: dependency.id, dependsOnTaskId: id });
+    }
+    return this.task(id);
   }
   startExecution(taskId: string, provider: string, actor = 'system') {
     const task = this.task(taskId);
     const plan = this.db.prepare("SELECT * FROM plans WHERE task_id=? AND status='approved'").get(taskId);
     if (!plan) throw new DomainError('execution requires an approved plan', 'PLAN_NOT_APPROVED');
+    const unmet = this.dependencies(taskId).filter(dependency => !dependency.satisfied);
+    if (unmet.length) throw new DomainError(`execution is blocked by ${unmet.map(dependency => String(dependency.depends_on_task_id)).join(', ')}`, 'DEPENDENCIES_UNMET');
     if (task.status !== 'ready') throw new DomainError('task must be ready before execution', 'INVALID_STATE');
     const id = randomUUID();
     try { this.db.prepare('INSERT INTO executions (id, task_id, provider, status, created_at) VALUES (?, ?, ?, ?, ?)').run(id, taskId, provider, 'active', this.now()); }
@@ -133,6 +180,8 @@ export class Store {
 
     return {
       task,
+      dependencies: this.dependencies(taskId),
+      blocked_dependents: this.blockedDependents(taskId),
       plan: plan ?? null,
       executions: executions.map(execution => ({
         ...execution,
