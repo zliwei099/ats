@@ -81,6 +81,15 @@ test('dependency API blocks execution until the prerequisite is accepted and exp
   assert.equal(evidence.body.blocked_dependents.length, 0);
   assert.ok(evidence.body.audit_events.some((event: Record<string, string>) => event.action === 'dependency_created'));
   assert.ok(evidence.body.audit_events.some((event: Record<string, string>) => event.action === 'dependency_resolved'));
+  const prerequisiteEvidence = await request('GET', `/tasks/${prerequisite.id}/evidence`);
+  const blockedDependent = prerequisiteEvidence.body.blocked_dependents[0];
+  assert.equal(prerequisiteEvidence.body.task.status, 'accepted');
+  assert.equal(blockedDependent.task_id, dependent.id);
+  assert.equal(blockedDependent.task_status, 'ready');
+  assert.equal(blockedDependent.satisfied, 1);
+  assert.ok(blockedDependent.resolved_at);
+  assert.ok(prerequisiteEvidence.body.audit_events.some((event: Record<string, string>) => event.action === 'dependency_created'));
+  assert.ok(prerequisiteEvidence.body.audit_events.some((event: Record<string, string>) => event.action === 'dependency_resolved'));
   const execution = await request('POST', `/tasks/${dependent.id}/executions`, { provider: 'noop' });
   assert.equal(execution.response.statusCode, 201);
   await app.close();

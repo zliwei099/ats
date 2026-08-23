@@ -87,15 +87,19 @@ export class Store {
     try { this.db.prepare('INSERT INTO task_dependencies (id, task_id, depends_on_task_id, created_at, resolved_at) VALUES (?, ?, ?, ?, ?)')
       .run(id, taskId, dependsOnTaskId, createdAt, prerequisite.status === 'accepted' ? createdAt : null); }
     catch { throw new DomainError('dependency already exists', 'CONFLICT'); }
-    this.audit('task', taskId, 'dependency_created', actor, { dependencyId: id, dependsOnTaskId });
-    if (prerequisite.status === 'accepted') this.audit('task', taskId, 'dependency_resolved', actor, { dependencyId: id, dependsOnTaskId });
+    this.audit('task', taskId, 'dependency_created', actor, { dependencyId: id, dependsOnTaskId, role: 'dependent' });
+    this.audit('task', dependsOnTaskId, 'dependency_created', actor, { dependencyId: id, taskId, role: 'prerequisite' });
+    if (prerequisite.status === 'accepted') {
+      this.audit('task', taskId, 'dependency_resolved', actor, { dependencyId: id, dependsOnTaskId, role: 'dependent' });
+      this.audit('task', dependsOnTaskId, 'dependency_resolved', actor, { dependencyId: id, taskId, role: 'prerequisite' });
+    }
     return this.dependencies(taskId).find(dependency => dependency.id === id)!;
   }
   dependencies(taskId: string) {
     this.task(taskId);
     return this.db.prepare(`SELECT dependency.id, dependency.task_id, dependency.depends_on_task_id, dependency.created_at, dependency.resolved_at,
       prerequisite.title AS depends_on_title, prerequisite.status AS depends_on_status,
-      CASE WHEN prerequisite.status = 'accepted' THEN 1 ELSE 0 END AS satisfied
+      CASE WHEN dependency.resolved_at IS NOT NULL THEN 1 ELSE 0 END AS satisfied
       FROM task_dependencies dependency JOIN tasks prerequisite ON prerequisite.id = dependency.depends_on_task_id
       WHERE dependency.task_id = ? ORDER BY dependency.created_at, dependency.id`).all(taskId) as RecordRow[];
   }
@@ -103,7 +107,7 @@ export class Store {
     this.task(taskId);
     return this.db.prepare(`SELECT dependency.id, dependency.task_id, dependency.depends_on_task_id, dependency.created_at, dependency.resolved_at,
       dependent.title AS task_title, dependent.status AS task_status,
-      CASE WHEN dependent.status = 'accepted' THEN 1 ELSE 0 END AS satisfied
+      CASE WHEN dependency.resolved_at IS NOT NULL THEN 1 ELSE 0 END AS satisfied
       FROM task_dependencies dependency JOIN tasks dependent ON dependent.id = dependency.task_id
       WHERE dependency.depends_on_task_id = ? ORDER BY dependency.created_at, dependency.id`).all(taskId) as RecordRow[];
   }
@@ -138,7 +142,10 @@ export class Store {
       const unresolved = this.db.prepare('SELECT id, task_id FROM task_dependencies WHERE depends_on_task_id=? AND resolved_at IS NULL ORDER BY created_at, id').all(id) as Array<{ id: string; task_id: string }>;
       const resolvedAt = this.now();
       this.db.prepare('UPDATE task_dependencies SET resolved_at=? WHERE depends_on_task_id=? AND resolved_at IS NULL').run(resolvedAt, id);
-      for (const dependency of unresolved) this.audit('task', dependency.task_id, 'dependency_resolved', actor, { dependencyId: dependency.id, dependsOnTaskId: id });
+      for (const dependency of unresolved) {
+        this.audit('task', dependency.task_id, 'dependency_resolved', actor, { dependencyId: dependency.id, dependsOnTaskId: id, role: 'dependent' });
+        this.audit('task', id, 'dependency_resolved', actor, { dependencyId: dependency.id, taskId: dependency.task_id, role: 'prerequisite' });
+      }
     }
     return this.task(id);
   }
