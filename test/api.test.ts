@@ -54,3 +54,33 @@ test('task evidence package joins approval, execution, transitions, and acceptan
   assert.ok(evidence.audit_events.every((event: Record<string, string>) => [task.id, plan.id, execution.id].includes(event.entity_id)));
   await app.close();
 });
+
+test('loopback console lists accepted tasks and reads their existing evidence package', async () => {
+  const app = buildServer(new Store());
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    assert.ok(response.statusCode < 300, response.body);
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  const project = (await request('POST', '/projects', { name: 'console' })).body;
+  const task = (await request('POST', `/projects/${project.id}/tasks`, { title: 'visible task' })).body;
+  const plan = (await request('POST', `/tasks/${task.id}/plans`, { body: 'read only' })).body;
+  await request('POST', `/plans/${plan.id}/submit`, {});
+  await request('POST', `/plans/${plan.id}/approve`, { actor: 'approver' });
+  const execution = (await request('POST', `/tasks/${task.id}/executions`, { provider: 'noop', actor: 'executor' })).body;
+  await request('POST', `/executions/${execution.id}/finish`, { actor: 'executor' });
+  await request('POST', `/tasks/${task.id}/accept`, { actor: 'acceptor' });
+
+  const accepted = await request('GET', '/tasks?status=accepted');
+  assert.deepEqual(accepted.body.map((item: Record<string, string>) => item.id), [task.id]);
+  const page = await app.inject({ method: 'GET', url: '/console' });
+  assert.equal(page.statusCode, 200);
+  assert.match(page.headers['content-type'] ?? '', /text\/html/);
+  assert.match(page.body, /任务证据包/);
+  const script = await app.inject({ method: 'GET', url: '/console.js' });
+  assert.equal(script.statusCode, 200);
+  assert.match(script.body, /\/tasks\?status=accepted/);
+  assert.match(script.body, /\/evidence/);
+  assert.doesNotMatch(script.body, /fetch\(['"]\/(?:projects|plans|executions)/);
+  await app.close();
+});

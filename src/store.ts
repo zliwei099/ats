@@ -70,6 +70,9 @@ export class Store {
     this.audit('task', id, 'created', actor, { projectId, title }); return this.task(id);
   }
   task(id: string) { const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as RecordRow | undefined; if (!row) throw new DomainError('task not found', 'NOT_FOUND'); return row; }
+  tasks(status?: TaskStatus) {
+    return this.db.prepare(status ? 'SELECT * FROM tasks WHERE status=? ORDER BY created_at, id' : 'SELECT * FROM tasks ORDER BY created_at, id').all(...(status ? [status] : [])) as RecordRow[];
+  }
   createPlan(taskId: string, body: string, actor = 'system') {
     this.task(taskId); const id = randomUUID(); const createdAt = this.now();
     try { this.db.prepare('INSERT INTO plans (id, task_id, body, status, created_at) VALUES (?, ?, ?, ?, ?)').run(id, taskId, body, 'draft', createdAt); }
