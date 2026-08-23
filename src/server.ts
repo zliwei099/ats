@@ -11,6 +11,7 @@ export function buildServer(store = new Store()) {
   app.post<{ Body: { name: string; actor?: string } }>('/projects', async (request, reply) => reply.code(201).send(store.createProject(request.body.name, request.body.actor)));
   app.post<{ Params: { projectId: string }; Body: { title: string; actor?: string } }>('/projects/:projectId/tasks', async (request, reply) => reply.code(201).send(store.createTask(request.params.projectId, request.body.title, request.body.actor)));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId', async request => store.task(request.params.taskId));
+  app.get<{ Params: { taskId: string } }>('/tasks/:taskId/evidence', async request => store.evidencePackage(request.params.taskId));
   app.post<{ Params: { taskId: string }; Body: { body: string; actor?: string } }>('/tasks/:taskId/plans', async (request, reply) => reply.code(201).send(store.createPlan(request.params.taskId, request.body.body, request.body.actor)));
   app.post<{ Params: { planId: string }; Body: { actor?: string } }>('/plans/:planId/submit', async request => store.submitPlan(request.params.planId, request.body.actor));
   app.post<{ Params: { planId: string }; Body: { actor: string } }>('/plans/:planId/approve', async request => store.decidePlan(request.params.planId, true, request.body.actor));

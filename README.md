@@ -27,9 +27,14 @@ execution_id=$(node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id)
 curl -sS -X POST http://127.0.0.1:3000/executions/$execution_id/finish -H 'content-type: application/json' -d '{}'
 curl -sS http://127.0.0.1:3000/audit/$task_id
 curl -sS -X POST http://127.0.0.1:3000/tasks/$task_id/accept -H 'content-type: application/json' -d '{"actor":"reviewer"}'
+curl -sS http://127.0.0.1:3000/tasks/$task_id/evidence
 curl -sS http://127.0.0.1:3000/tasks/$task_id
 ```
 
 最后一个响应的 `status` 应为 `accepted`。SQLite schema 会在服务首次启动时自动创建；如果 `ATS_DB` 指向不存在的父目录，服务也会自动创建该目录。
+
+## 任务证据包查询
+
+`GET /tasks/:taskId/evidence` 是给 loopback 控制台与独立复核使用的稳定证据视图。它只读取已有持久化记录，不会改写审计事件；响应包含 `task`、已关联的 `plan`、按 `created_at, id` 排序的 `executions`，以及按不可变写入 `sequence` 排序的 `audit_events`。`status_transitions` 和最终 `acceptance` 均由这些审计事件派生。计划的 `decided_by` 是审批人，执行条目的 `started_by` / `finished_by` 是执行者，`acceptance.actor` 是验收人（尚未验收时为 `null`）。
 
 验证：`npm test`、`npm run typecheck`。
