@@ -23,3 +23,34 @@ test('HTTP API completes the documented approval and execution loop', async () =
   assert.ok(events.length >= 4);
   await app.close();
 });
+
+test('task evidence package joins approval, execution, transitions, and acceptance in a stable order', async () => {
+  const app = buildServer(new Store());
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    assert.ok(response.statusCode < 300, response.body);
+    return JSON.parse(response.body) as Record<string, any>;
+  };
+  const project = await request('POST', '/projects', { name: 'evidence' });
+  const task = await request('POST', `/projects/${project.id}/tasks`, { title: 'ship', actor: 'planner' });
+  const plan = await request('POST', `/tasks/${task.id}/plans`, { body: 'reviewed plan', actor: 'planner' });
+  await request('POST', `/plans/${plan.id}/submit`, { actor: 'planner' });
+  await request('POST', `/plans/${plan.id}/approve`, { actor: 'approver' });
+  const execution = await request('POST', `/tasks/${task.id}/executions`, { provider: 'noop', actor: 'executor' });
+  await request('POST', `/executions/${execution.id}/finish`, { actor: 'executor' });
+  await request('POST', `/tasks/${task.id}/accept`, { actor: 'acceptor' });
+
+  const evidence = await request('GET', `/tasks/${task.id}/evidence`);
+  const repeated = await request('GET', `/tasks/${task.id}/evidence`);
+  assert.deepEqual(repeated, evidence);
+  assert.equal(evidence.task.id, task.id);
+  assert.equal(evidence.plan.id, plan.id);
+  assert.equal(evidence.plan.decided_by, 'approver');
+  assert.equal(evidence.executions[0].id, execution.id);
+  assert.equal(evidence.executions[0].started_by, 'executor');
+  assert.equal(evidence.executions[0].finished_by, 'executor');
+  assert.deepEqual(evidence.status_transitions.map((transition: Record<string, string>) => transition.to), ['ready', 'executing', 'awaiting_acceptance', 'accepted']);
+  assert.equal(evidence.acceptance.actor, 'acceptor');
+  assert.ok(evidence.audit_events.every((event: Record<string, string>) => [task.id, plan.id, execution.id].includes(event.entity_id)));
+  await app.close();
+});
