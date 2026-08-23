@@ -27,7 +27,10 @@ export type EvidencePackage = {
   status_transitions: Array<{ event_id: string; from: string; to: string; actor: string; created_at: string }>;
   acceptance: { event_id: string; actor: string; created_at: string } | null;
   audit_events: Array<RecordRow & { detail: unknown }>;
+  decision_memories: Array<RecordRow>;
 };
+
+export type DecisionSource = { type: 'url' | 'task' | 'audit'; reference: string };
 
 export class DomainError extends Error {
   constructor(message: string, readonly code = 'DOMAIN_ERROR') { super(message); }
@@ -52,6 +55,19 @@ export class Store {
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_execution_per_task ON executions(task_id) WHERE status = 'active';
       CREATE TABLE IF NOT EXISTS task_dependencies (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), depends_on_task_id TEXT NOT NULL REFERENCES tasks(id), created_at TEXT NOT NULL, resolved_at TEXT, UNIQUE(task_id, depends_on_task_id), CHECK(task_id <> depends_on_task_id));
       CREATE INDEX IF NOT EXISTS task_dependencies_depends_on ON task_dependencies(depends_on_task_id);
+      CREATE TABLE IF NOT EXISTS decision_memories (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        content TEXT NOT NULL,
+        source_type TEXT NOT NULL CHECK(source_type IN ('url', 'task', 'audit')),
+        source_reference TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'superseded')),
+        superseded_by TEXT REFERENCES decision_memories(id)
+      );
+      CREATE INDEX IF NOT EXISTS decision_memories_project_status_created ON decision_memories(project_id, status, created_at, id);
       CREATE TABLE IF NOT EXISTS audit_events (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, actor TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL, sequence INTEGER);
     `);
     const columns = this.db.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
@@ -72,6 +88,51 @@ export class Store {
     const id = randomUUID(); const createdAt = this.now();
     this.db.prepare('INSERT INTO tasks VALUES (?, ?, ?, ?, ?)').run(id, projectId, title, 'planned', createdAt);
     this.audit('task', id, 'created', actor, { projectId, title }); return this.task(id);
+  }
+  private project(id: string) {
+    const project = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as RecordRow | undefined;
+    if (!project) throw new DomainError('project not found', 'NOT_FOUND');
+    return project;
+  }
+  private validateDecisionSource(source: DecisionSource) {
+    if (!source || !['url', 'task', 'audit'].includes(source.type) || typeof source.reference !== 'string' || !source.reference.trim()) {
+      throw new DomainError('decision source must be a URL, task, or audit reference', 'INVALID_DECISION_SOURCE');
+    }
+    if (source.type === 'url') {
+      try { new URL(source.reference); } catch { throw new DomainError('decision URL source is invalid', 'INVALID_DECISION_SOURCE'); }
+    }
+  }
+  createDecisionMemory(projectId: string, content: string, source: DecisionSource, scope: string, actor = 'system') {
+    this.project(projectId); this.validateDecisionSource(source);
+    if (!content?.trim() || !scope?.trim()) throw new DomainError('decision content and scope are required', 'INVALID_DECISION');
+    const id = randomUUID(); const createdAt = this.now();
+    this.db.prepare(`INSERT INTO decision_memories (id, project_id, content, source_type, source_reference, scope, created_by, created_at, status, superseded_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL)`).run(id, projectId, content.trim(), source.type, source.reference.trim(), scope.trim(), actor, createdAt);
+    this.audit('decision_memory', id, 'created', actor, { projectId, source, scope: scope.trim() });
+    return this.decisionMemory(id);
+  }
+  decisionMemory(id: string) {
+    const row = this.db.prepare(`SELECT decision.*, replacement.content AS superseded_by_content
+      FROM decision_memories decision LEFT JOIN decision_memories replacement ON replacement.id = decision.superseded_by WHERE decision.id = ?`).get(id) as RecordRow | undefined;
+    if (!row) throw new DomainError('decision memory not found', 'NOT_FOUND');
+    return row;
+  }
+  decisionMemories(projectId: string, status: 'active' | 'superseded' | 'all' = 'active') {
+    this.project(projectId);
+    const filter = status === 'all' ? '' : ' AND decision.status = ?';
+    const params = status === 'all' ? [projectId] : [projectId, status];
+    return this.db.prepare(`SELECT decision.*, replacement.content AS superseded_by_content
+      FROM decision_memories decision LEFT JOIN decision_memories replacement ON replacement.id = decision.superseded_by
+      WHERE decision.project_id = ?${filter} ORDER BY decision.created_at, decision.id`).all(...params) as RecordRow[];
+  }
+  supersedeDecisionMemory(id: string, replacementId: string, actor = 'system') {
+    const decision = this.decisionMemory(id); const replacement = this.decisionMemory(replacementId);
+    if (id === replacementId || decision.project_id !== replacement.project_id) throw new DomainError('replacement decision must be another decision in the same project', 'INVALID_SUPERSESSION');
+    if (decision.status !== 'active') throw new DomainError('only active decisions may be superseded', 'INVALID_STATE');
+    this.db.prepare("UPDATE decision_memories SET status='superseded', superseded_by=? WHERE id=?").run(replacementId, id);
+    this.audit('decision_memory', id, 'superseded', actor, { replacementId });
+    this.audit('decision_memory', replacementId, 'supersedes', actor, { decisionId: id });
+    return this.decisionMemory(id);
   }
   addDependency(taskId: string, dependsOnTaskId: string, actor = 'system') {
     const task = this.task(taskId); const prerequisite = this.task(dependsOnTaskId);
@@ -175,6 +236,7 @@ export class Store {
     const entityIds = [taskId, ...(plan ? [String(plan.id)] : []), ...executions.map(execution => String(execution.id))];
     const placeholders = entityIds.map(() => '?').join(', ');
     const events = this.db.prepare(`SELECT * FROM audit_events WHERE entity_id IN (${placeholders}) ORDER BY sequence IS NULL, sequence, created_at, id`).all(...entityIds) as AuditEventRow[];
+    const decisionMemories = this.decisionMemories(String(task.project_id), 'all');
     const parsedEvents = events.map(event => ({ ...event, detail: JSON.parse(event.detail) as unknown }));
     const eventFor = (entityId: string, action: string) => events.find(event => event.entity_id === entityId && event.action === action);
     const statusTransitions = events
@@ -197,7 +259,8 @@ export class Store {
       })),
       status_transitions: statusTransitions,
       acceptance: acceptanceEvent ? { event_id: acceptanceEvent.id, actor: acceptanceEvent.actor, created_at: acceptanceEvent.created_at } : null,
-      audit_events: parsedEvents
+      audit_events: parsedEvents,
+      decision_memories: decisionMemories
     };
   }
   close() { this.db.close(); }

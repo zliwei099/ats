@@ -137,3 +137,49 @@ test('loopback console lists accepted tasks and reads their existing evidence pa
   assert.doesNotMatch(script.body, /fetch\(['"]\/(?:projects|plans|executions)/);
   await app.close();
 });
+
+test('project decision memories retain sources, stable history, and supersession without weakening workflow gates', async () => {
+  const app = buildServer(new Store());
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  const project = (await request('POST', '/projects', { name: 'memory' })).body;
+  const otherProject = (await request('POST', '/projects', { name: 'other' })).body;
+  const first = await request('POST', `/projects/${project.id}/decision-memories`, {
+    content: 'Use SQLite for the local MVP', source: { type: 'url', reference: 'https://example.test/adr/1' }, scope: 'local MVP', actor: 'architect'
+  });
+  const second = await request('POST', `/projects/${project.id}/decision-memories`, {
+    content: 'Use SQLite WAL for concurrent local readers', source: { type: 'task', reference: 'ATS-28' }, scope: 'persistence', actor: 'architect'
+  });
+  assert.equal(first.response.statusCode, 201); assert.equal(second.response.statusCode, 201);
+  const activeBefore = await request('GET', `/projects/${project.id}/decision-memories`);
+  assert.deepEqual(activeBefore.body.map((memory: Record<string, string>) => memory.id), [first.body.id, second.body.id]);
+  assert.equal(activeBefore.body[0].source_type, 'url'); assert.equal(activeBefore.body[1].source_reference, 'ATS-28');
+  const superseded = await request('POST', `/decision-memories/${first.body.id}/supersede`, { replacementDecisionId: second.body.id, actor: 'reviewer' });
+  assert.equal(superseded.response.statusCode, 200); assert.equal(superseded.body.status, 'superseded'); assert.equal(superseded.body.superseded_by, second.body.id);
+  const active = await request('GET', `/projects/${project.id}/decision-memories`);
+  assert.deepEqual(active.body.map((memory: Record<string, string>) => memory.id), [second.body.id]);
+  const history = await request('GET', `/projects/${project.id}/decision-memories?status=all`);
+  assert.deepEqual(history.body.map((memory: Record<string, string>) => memory.id), [first.body.id, second.body.id]);
+  assert.equal(history.body[0].superseded_by_content, second.body.content);
+  const wrongProject = await request('POST', `/projects/${otherProject.id}/decision-memories`, {
+    content: 'Other decision', source: { type: 'audit', reference: 'audit:event-1' }, scope: 'other'
+  });
+  const invalidReplacement = await request('POST', `/decision-memories/${second.body.id}/supersede`, { replacementDecisionId: wrongProject.body.id });
+  assert.equal(invalidReplacement.response.statusCode, 422); assert.equal(invalidReplacement.body.error, 'INVALID_SUPERSESSION');
+  const missingProject = await request('GET', '/projects/missing/decision-memories');
+  assert.equal(missingProject.response.statusCode, 404);
+  const invalidSource = await request('POST', `/projects/${project.id}/decision-memories`, { content: 'bad', source: { type: 'url', reference: 'not a URL' }, scope: 'test' });
+  assert.equal(invalidSource.response.statusCode, 422); assert.equal(invalidSource.body.error, 'INVALID_DECISION_SOURCE');
+
+  const task = (await request('POST', `/projects/${project.id}/tasks`, { title: 'workflow remains gated' })).body;
+  const blockedExecution = await request('POST', `/tasks/${task.id}/executions`, { provider: 'noop' });
+  assert.equal(blockedExecution.response.statusCode, 422); assert.equal(blockedExecution.body.error, 'PLAN_NOT_APPROVED');
+  const evidence = await request('GET', `/tasks/${task.id}/evidence`);
+  assert.deepEqual(evidence.body.decision_memories.map((memory: Record<string, string>) => memory.id), [first.body.id, second.body.id]);
+  const script = await app.inject({ method: 'GET', url: '/console.js' });
+  assert.match(script.body, /项目决策记忆/);
+  assert.doesNotMatch(script.body, /decision-memories.*POST/);
+  await app.close();
+});

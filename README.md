@@ -65,3 +65,19 @@ curl -sS http://127.0.0.1:3000/tasks/$dependent_id/evidence
 启动服务并按上面的 API 闭环创建一个已验收任务后，在浏览器打开 `http://127.0.0.1:3000/console`。下拉框只列出已验收任务；选择任务即可读取既有 `GET /tasks/:taskId/evidence` 证据包，按稳定顺序展示计划决策人、执行责任人、状态迁移、验收人和审计记录。也可以使用 `http://127.0.0.1:3000/console?taskId=<任务ID>` 直接打开某个已验收任务。
 
 该控制台仅调用 `GET /tasks?status=accepted` 和 `GET /tasks/:taskId/evidence`，不提供任何写入操作，服务仍只监听 `127.0.0.1`。
+
+## 项目决策记忆与来源追溯
+
+决策记忆是项目级、可审计的协作记录，不是个人长期记忆。每条记录须包含简明内容、适用范围，以及结构化来源：`url`（完整 URL）、`task`（任务引用）或 `audit`（审计引用）。不得写入 API token、密钥、个人隐私或执行者私有经历。
+
+```sh
+decision=$(curl -sS -X POST http://127.0.0.1:3000/projects/$project_id/decision-memories -H 'content-type: application/json' -d '{"content":"本地 MVP 使用 SQLite","source":{"type":"url","reference":"https://example.test/adr/sqlite"},"scope":"本地 MVP","actor":"architect"}')
+decision_id=$(node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id))' <<< "$decision")
+replacement=$(curl -sS -X POST http://127.0.0.1:3000/projects/$project_id/decision-memories -H 'content-type: application/json' -d '{"content":"并发读场景使用 SQLite WAL","source":{"type":"task","reference":"ATS-28"},"scope":"持久化","actor":"architect"}')
+replacement_id=$(node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id))' <<< "$replacement")
+curl -sS -X POST http://127.0.0.1:3000/decision-memories/$decision_id/supersede -H 'content-type: application/json' -d "{\"replacementDecisionId\":\"$replacement_id\",\"actor\":\"reviewer\"}"
+curl -sS http://127.0.0.1:3000/projects/$project_id/decision-memories                 # 默认仅 active
+curl -sS 'http://127.0.0.1:3000/projects/'$project_id'/decision-memories?status=all' # 完整历史
+```
+
+替代关系只能连接同一项目内的两条不同决策；无效项目、无效来源或跨项目替代均被拒绝。所有列表按 `created_at, id` 稳定排序。任务证据包会只读包含该任务所属项目的完整决策历史；启动服务后打开 `http://127.0.0.1:3000/console`，选择已验收任务即可查看，控制台不提供决策或状态机的写入口。

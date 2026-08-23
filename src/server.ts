@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import { consoleHtml, consoleScript } from './console.js';
-import { DomainError, Store } from './store.js';
+import { DecisionSource, DomainError, Store } from './store.js';
 
 export function buildServer(store = new Store()) {
   const app = Fastify({ logger: false });
@@ -12,6 +12,13 @@ export function buildServer(store = new Store()) {
   app.get('/console', async (_request, reply) => reply.type('text/html; charset=utf-8').send(consoleHtml));
   app.get('/console.js', async (_request, reply) => reply.type('application/javascript; charset=utf-8').send(consoleScript));
   app.post<{ Body: { name: string; actor?: string } }>('/projects', async (request, reply) => reply.code(201).send(store.createProject(request.body.name, request.body.actor)));
+  app.post<{ Params: { projectId: string }; Body: { content: string; source: DecisionSource; scope: string; actor?: string } }>('/projects/:projectId/decision-memories', async (request, reply) => reply.code(201).send(store.createDecisionMemory(request.params.projectId, request.body.content, request.body.source, request.body.scope, request.body.actor)));
+  app.get<{ Params: { projectId: string }; Querystring: { status?: 'active' | 'superseded' | 'all' } }>('/projects/:projectId/decision-memories', async request => {
+    const status = request.query.status ?? 'active';
+    if (!['active', 'superseded', 'all'].includes(status)) throw new DomainError('decision status filter is invalid', 'INVALID_DECISION');
+    return store.decisionMemories(request.params.projectId, status);
+  });
+  app.post<{ Params: { decisionId: string }; Body: { replacementDecisionId: string; actor?: string } }>('/decision-memories/:decisionId/supersede', async request => store.supersedeDecisionMemory(request.params.decisionId, request.body.replacementDecisionId, request.body.actor));
   app.post<{ Params: { projectId: string }; Body: { title: string; actor?: string } }>('/projects/:projectId/tasks', async (request, reply) => reply.code(201).send(store.createTask(request.params.projectId, request.body.title, request.body.actor)));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId', async request => store.task(request.params.taskId));
   app.get<{ Querystring: { status?: 'accepted' } }>('/tasks', async request => store.tasks(request.query.status));

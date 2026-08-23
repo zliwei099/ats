@@ -49,6 +49,7 @@ function render(evidence) {
     + section('执行', rows(evidence.executions, [{ label: 'Provider', key: 'provider' }, { label: '状态', key: 'status' }, { label: '启动责任人', key: 'started_by' }, { label: '完成责任人', key: 'finished_by' }, { label: '创建时间', key: 'created_at' }, { label: '完成时间', key: 'finished_at' }]))
     + section('状态迁移', rows(evidence.status_transitions, [{ label: '从', key: 'from' }, { label: '到', key: 'to' }, { label: '责任人', key: 'actor' }, { label: '时间', key: 'created_at' }]))
     + section('验收', acceptance)
+    + section('项目决策记忆（只读）', rows(evidence.decision_memories, [{ label: '内容', key: 'content' }, { label: '来源', html: decision => text(decision.source_type) + ': ' + text(decision.source_reference) }, { label: '适用范围', key: 'scope' }, { label: '状态', key: 'status' }, { label: '替代决策', html: decision => text(decision.superseded_by_content) + ' / ' + text(decision.superseded_by) }, { label: '创建者', key: 'created_by' }, { label: '创建时间', key: 'created_at' }]))
     + section('审计记录', rows(evidence.audit_events, [{ label: '序号', key: 'sequence' }, { label: '实体', html: event => text(event.entity_type) + ' / ' + text(event.entity_id) }, { label: '动作', key: 'action' }, { label: '责任人', key: 'actor' }, { label: '详情', html: event => '<code>' + text(JSON.stringify(event.detail)) + '</code>' }, { label: '时间', key: 'created_at' }]));
 }
 async function loadEvidence() {
