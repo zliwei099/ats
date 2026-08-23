@@ -17,6 +17,8 @@ export function buildServer(store = new Store()) {
   app.post<{ Params: { planId: string }; Body: { actor: string } }>('/plans/:planId/reject', async request => store.decidePlan(request.params.planId, false, request.body.actor));
   app.post<{ Params: { taskId: string }; Body: { provider: string; actor?: string } }>('/tasks/:taskId/executions', async (request, reply) => reply.code(201).send(store.startExecution(request.params.taskId, request.body.provider, request.body.actor)));
   app.post<{ Params: { executionId: string }; Body: { actor?: string } }>('/executions/:executionId/finish', async request => store.finishExecution(request.params.executionId, request.body.actor));
+  app.post<{ Params: { taskId: string }; Body: { actor?: string } }>('/tasks/:taskId/accept', async request => store.transitionTask(request.params.taskId, 'accepted', request.body.actor));
+  app.post<{ Params: { taskId: string }; Body: { actor?: string } }>('/tasks/:taskId/reject', async request => store.transitionTask(request.params.taskId, 'rejected', request.body.actor));
   app.get<{ Params: { entityId: string } }>('/audit/:entityId', async request => store.auditEvents(request.params.entityId));
   return app;
 }

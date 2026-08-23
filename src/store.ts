@@ -1,5 +1,7 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 export type PlanStatus = 'draft' | 'submitted' | 'approved' | 'rejected';
 export type TaskStatus = 'planned' | 'ready' | 'executing' | 'awaiting_acceptance' | 'accepted' | 'rejected';
@@ -17,6 +19,7 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
 export class Store {
   readonly db: Database.Database;
   constructor(filename = ':memory:') {
+    if (filename !== ':memory:') mkdirSync(dirname(filename), { recursive: true });
     this.db = new Database(filename);
     this.db.pragma('foreign_keys = ON');
     this.db.exec(`
