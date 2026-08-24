@@ -41,6 +41,18 @@ export type DependencyView = {
   can_start: boolean;
 };
 
+export type TaskRisk = {
+  task_id: string;
+  title: string;
+  owner: string;
+  status: string;
+  risk_code: 'OVERDUE' | 'DUE_SOON' | 'STALE';
+  severity: 'critical' | 'high' | 'medium';
+  trigger_facts: Record<string, string | number>;
+  last_activity_at: string;
+  next_action: { code: string; condition: string };
+};
+
 export type DecisionSource = { type: 'url' | 'task' | 'audit'; reference: string };
 
 export class DomainError extends Error {
@@ -54,13 +66,13 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
 
 export class Store {
   readonly db: Database.Database;
-  constructor(filename = ':memory:') {
+  constructor(filename = ':memory:', private readonly clock: () => Date = () => new Date()) {
     if (filename !== ':memory:') mkdirSync(dirname(filename), { recursive: true });
     this.db = new Database(filename);
     this.db.pragma('foreign_keys = ON');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL, status TEXT NOT NULL, owner TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL, status TEXT NOT NULL, owner TEXT NOT NULL, created_at TEXT NOT NULL, due_at TEXT);
       CREATE TABLE IF NOT EXISTS plans (id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id), body TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, created_at TEXT NOT NULL, decided_at TEXT);
       CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), provider TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT, failure_category TEXT, failure_reason TEXT, retry_of_execution_id TEXT REFERENCES executions(id));
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_execution_per_task ON executions(task_id) WHERE status = 'active';
@@ -89,6 +101,7 @@ export class Store {
       this.db.exec("ALTER TABLE tasks ADD COLUMN owner TEXT NOT NULL DEFAULT 'system'");
       this.db.exec("UPDATE tasks SET owner = COALESCE((SELECT actor FROM audit_events WHERE entity_type='task' AND entity_id=tasks.id AND action='created' ORDER BY sequence, created_at, id LIMIT 1), owner)");
     }
+    if (!taskColumns.some(column => column.name === 'due_at')) this.db.exec('ALTER TABLE tasks ADD COLUMN due_at TEXT');
     const executionColumns = this.db.prepare('PRAGMA table_info(executions)').all() as Array<{ name: string }>;
     if (!executionColumns.some(column => column.name === 'failure_category')) this.db.exec('ALTER TABLE executions ADD COLUMN failure_category TEXT');
     if (!executionColumns.some(column => column.name === 'failure_reason')) this.db.exec('ALTER TABLE executions ADD COLUMN failure_reason TEXT');
@@ -100,7 +113,7 @@ export class Store {
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS decision_memories_project_status_order ON decision_memories(project_id, status, created_at, created_sequence)');
   }
-  private now() { return new Date().toISOString(); }
+  private now() { return this.clock().toISOString(); }
   private audit(entityType: string, entityId: string, action: string, actor: string, detail: unknown) {
     this.db.prepare('INSERT INTO audit_events (id, entity_type, entity_id, action, actor, detail, created_at, sequence) VALUES (?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM audit_events))')
       .run(randomUUID(), entityType, entityId, action, actor, JSON.stringify(detail), this.now());
@@ -110,12 +123,14 @@ export class Store {
     this.db.prepare('INSERT INTO projects VALUES (?, ?, ?)').run(id, name, createdAt);
     this.audit('project', id, 'created', actor, { name }); return { id, name, createdAt };
   }
-  createTask(projectId: string, title: string, actor = 'system') {
+  createTask(projectId: string, title: string, actor = 'system', dueAt?: string) {
     if (!this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId)) throw new DomainError('project not found', 'NOT_FOUND');
     if (!actor?.trim()) throw new DomainError('task owner is required', 'INVALID_OWNER');
+    if (dueAt !== undefined && (!dueAt.trim() || Number.isNaN(Date.parse(dueAt)))) throw new DomainError('task due_at must be a valid ISO date-time', 'INVALID_DUE_DATE');
     const id = randomUUID(); const createdAt = this.now();
-    this.db.prepare('INSERT INTO tasks (id, project_id, title, status, owner, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, projectId, title, 'planned', actor.trim(), createdAt);
-    this.audit('task', id, 'created', actor.trim(), { projectId, title, owner: actor.trim() }); return this.task(id);
+    const normalizedDueAt = dueAt === undefined ? null : new Date(dueAt).toISOString();
+    this.db.prepare('INSERT INTO tasks (id, project_id, title, status, owner, created_at, due_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, projectId, title, 'planned', actor.trim(), createdAt, normalizedDueAt);
+    this.audit('task', id, 'created', actor.trim(), { projectId, title, owner: actor.trim(), due_at: normalizedDueAt }); return this.task(id);
   }
   private project(id: string) {
     const project = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as RecordRow | undefined;
@@ -248,6 +263,34 @@ export class Store {
   }
   tasks(status?: TaskStatus) {
     return this.db.prepare(status ? 'SELECT * FROM tasks WHERE status=? ORDER BY created_at, id' : 'SELECT * FROM tasks ORDER BY created_at, id').all(...(status ? [status] : [])) as RecordRow[];
+  }
+  private taskActivity(task: RecordRow) {
+    const plan = this.db.prepare('SELECT id FROM plans WHERE task_id=?').get(String(task.id)) as { id: string } | undefined;
+    const executions = this.db.prepare('SELECT id FROM executions WHERE task_id=?').all(String(task.id)) as Array<{ id: string }>;
+    const ids = [String(task.id), ...(plan ? [plan.id] : []), ...executions.map(execution => execution.id)];
+    const placeholders = ids.map(() => '?').join(', ');
+    return this.db.prepare(`SELECT created_at FROM audit_events WHERE entity_id IN (${placeholders}) ORDER BY created_at DESC, sequence DESC, id DESC LIMIT 1`).get(...ids) as { created_at: string } | undefined;
+  }
+  private riskForTask(task: RecordRow, now: Date): TaskRisk | null {
+    if (task.status === 'accepted') return null;
+    const lastActivityAt = this.taskActivity(task)?.created_at ?? String(task.created_at);
+    const dueAt = task.due_at ? new Date(String(task.due_at)) : null;
+    const ageHours = Math.floor((now.getTime() - new Date(lastActivityAt).getTime()) / 3_600_000);
+    const base = { task_id: String(task.id), title: String(task.title), owner: String(task.owner), status: String(task.status), last_activity_at: lastActivityAt };
+    if (dueAt && dueAt.getTime() < now.getTime()) return { ...base, risk_code: 'OVERDUE', severity: 'critical', trigger_facts: { due_at: dueAt.toISOString(), observed_at: now.toISOString(), overdue_hours: Math.floor((now.getTime() - dueAt.getTime()) / 3_600_000) }, next_action: { code: 'ESCALATE_OWNER', condition: 'Task remains unfinished after its due_at.' } };
+    if (dueAt && dueAt.getTime() - now.getTime() <= 24 * 3_600_000) return { ...base, risk_code: 'DUE_SOON', severity: 'high', trigger_facts: { due_at: dueAt.toISOString(), observed_at: now.toISOString(), remaining_hours: Math.ceil((dueAt.getTime() - now.getTime()) / 3_600_000) }, next_action: { code: 'CONFIRM_RECOVERY_PLAN', condition: 'Task remains unfinished and is due within 24 hours.' } };
+    if (ageHours >= 7 * 24) return { ...base, risk_code: 'STALE', severity: 'medium', trigger_facts: { last_activity_at: lastActivityAt, observed_at: now.toISOString(), inactive_hours: ageHours }, next_action: { code: 'REQUEST_OWNER_UPDATE', condition: 'Task remains unfinished with no activity for at least 7 days.' } };
+    return null;
+  }
+  taskRisk(taskId: string, now = this.clock()) {
+    return this.riskForTask(this.task(taskId), now);
+  }
+  projectRisks(projectId: string, now = this.clock()) {
+    this.project(projectId);
+    const severityOrder = { critical: 0, high: 1, medium: 2 };
+    return (this.db.prepare('SELECT * FROM tasks WHERE project_id=? ORDER BY id').all(projectId) as RecordRow[])
+      .map(task => this.riskForTask(task, now)).filter((risk): risk is TaskRisk => risk !== null)
+      .sort((left, right) => severityOrder[left.severity] - severityOrder[right.severity] || left.last_activity_at.localeCompare(right.last_activity_at) || left.task_id.localeCompare(right.task_id));
   }
   createPlan(taskId: string, body: string, actor = 'system') {
     this.task(taskId); const id = randomUUID(); const createdAt = this.now();

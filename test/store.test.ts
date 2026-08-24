@@ -128,3 +128,28 @@ test('decision memories retain creation order when timestamps collide', () => {
   const second = store.createDecisionMemory(String(project.id), 'Second decision', { type: 'audit', reference: 'audit:2' }, 'MVP');
   assert.deepEqual(store.decisionMemories(String(project.id), 'all').map(memory => memory.id), [first.id, second.id]);
 });
+
+test('task risks respect exact time boundaries, stable severity sorting, owners, and completed-task exclusion', () => {
+  const createdAt = new Date('2026-08-17T12:00:00.000Z');
+  const observedAt = new Date('2026-08-24T12:00:00.000Z');
+  let current = createdAt;
+  const store = new Store(':memory:', () => current);
+  const project = store.createProject('P'); const projectId = String(project.id);
+  const stale = store.createTask(projectId, 'stale', 'carol');
+  current = observedAt;
+  const overdue = store.createTask(projectId, 'overdue', 'alice', '2026-08-24T11:59:59.999Z');
+  const dueSoon = store.createTask(projectId, 'due soon', 'bob', '2026-08-25T12:00:00.000Z');
+  const safe = store.createTask(projectId, 'safe', 'dana', '2026-08-25T12:00:00.001Z');
+  const exact = store.createTask(projectId, 'exact boundary', 'erin', '2026-08-25T12:00:00.000Z');
+  const risks = store.projectRisks(projectId, observedAt);
+  assert.deepEqual(risks.map(risk => risk.risk_code), ['OVERDUE', 'DUE_SOON', 'DUE_SOON', 'STALE']);
+  assert.equal(risks[0].owner, 'alice'); assert.equal(risks[3].owner, 'carol');
+  assert.deepEqual(risks.slice(1, 3).map(risk => risk.owner).sort(), ['bob', 'erin']);
+  assert.deepEqual(store.projectRisks(projectId, observedAt), risks);
+  assert.equal(store.taskRisk(String(safe.id), observedAt), null);
+  assert.equal(store.taskRisk(String(exact.id), observedAt)?.trigger_facts.remaining_hours, 24);
+  assert.equal(store.taskRisk(String(stale.id), observedAt)?.trigger_facts.inactive_hours, 168);
+  store.db.prepare("UPDATE tasks SET status='accepted' WHERE id=?").run(overdue.id);
+  assert.deepEqual(new Set(store.projectRisks(projectId, observedAt).map(risk => risk.task_id)), new Set([String(dueSoon.id), String(exact.id), String(stale.id)]));
+  assert.throws(() => store.createTask(projectId, 'bad', 'owner', 'invalid-date'), (error: any) => error.code === 'INVALID_DUE_DATE');
+});
