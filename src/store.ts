@@ -65,6 +65,7 @@ export class Store {
         scope TEXT NOT NULL,
         created_by TEXT NOT NULL,
         created_at TEXT NOT NULL,
+        created_sequence INTEGER NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('active', 'superseded')),
         superseded_by TEXT REFERENCES decision_memories(id)
       );
@@ -77,6 +78,12 @@ export class Store {
     if (!executionColumns.some(column => column.name === 'failure_category')) this.db.exec('ALTER TABLE executions ADD COLUMN failure_category TEXT');
     if (!executionColumns.some(column => column.name === 'failure_reason')) this.db.exec('ALTER TABLE executions ADD COLUMN failure_reason TEXT');
     if (!executionColumns.some(column => column.name === 'retry_of_execution_id')) this.db.exec('ALTER TABLE executions ADD COLUMN retry_of_execution_id TEXT');
+    const decisionMemoryColumns = this.db.prepare('PRAGMA table_info(decision_memories)').all() as Array<{ name: string }>;
+    if (!decisionMemoryColumns.some(column => column.name === 'created_sequence')) {
+      this.db.exec('ALTER TABLE decision_memories ADD COLUMN created_sequence INTEGER');
+      this.db.exec('UPDATE decision_memories SET created_sequence = rowid WHERE created_sequence IS NULL');
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS decision_memories_project_status_order ON decision_memories(project_id, status, created_at, created_sequence)');
   }
   private now() { return new Date().toISOString(); }
   private audit(entityType: string, entityId: string, action: string, actor: string, detail: unknown) {
@@ -111,8 +118,8 @@ export class Store {
     this.project(projectId); this.validateDecisionSource(source);
     if (!content?.trim() || !scope?.trim()) throw new DomainError('decision content and scope are required', 'INVALID_DECISION');
     const id = randomUUID(); const createdAt = this.now();
-    this.db.prepare(`INSERT INTO decision_memories (id, project_id, content, source_type, source_reference, scope, created_by, created_at, status, superseded_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL)`).run(id, projectId, content.trim(), source.type, source.reference.trim(), scope.trim(), actor, createdAt);
+    this.db.prepare(`INSERT INTO decision_memories (id, project_id, content, source_type, source_reference, scope, created_by, created_at, created_sequence, status, superseded_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(created_sequence), 0) + 1 FROM decision_memories), 'active', NULL)`).run(id, projectId, content.trim(), source.type, source.reference.trim(), scope.trim(), actor, createdAt);
     this.audit('decision_memory', id, 'created', actor, { projectId, source, scope: scope.trim() });
     return this.decisionMemory(id);
   }
@@ -128,7 +135,7 @@ export class Store {
     const params = status === 'all' ? [projectId] : [projectId, status];
     return this.db.prepare(`SELECT decision.*, replacement.content AS superseded_by_content
       FROM decision_memories decision LEFT JOIN decision_memories replacement ON replacement.id = decision.superseded_by
-      WHERE decision.project_id = ?${filter} ORDER BY decision.created_at, decision.id`).all(...params) as RecordRow[];
+      WHERE decision.project_id = ?${filter} ORDER BY decision.created_at, decision.created_sequence`).all(...params) as RecordRow[];
   }
   supersedeDecisionMemory(id: string, replacementId: string, actor = 'system') {
     const decision = this.decisionMemory(id); const replacement = this.decisionMemory(replacementId);

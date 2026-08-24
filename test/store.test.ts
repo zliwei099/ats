@@ -71,3 +71,11 @@ test('retry preserves approval and dependency gates', () => {
   approve(store, prerequisite); store.addDependency(taskId, prerequisite);
   mustThrow(() => store.retryExecution(String(first.id)), 'DEPENDENCIES_UNMET');
 });
+test('decision memories retain creation order when timestamps collide', () => {
+  const store = new Store();
+  (store as any).now = () => '2026-08-24T00:00:00.000Z';
+  const project = store.createProject('P');
+  const first = store.createDecisionMemory(String(project.id), 'First decision', { type: 'task', reference: 'ATS-1' }, 'MVP');
+  const second = store.createDecisionMemory(String(project.id), 'Second decision', { type: 'audit', reference: 'audit:2' }, 'MVP');
+  assert.deepEqual(store.decisionMemories(String(project.id), 'all').map(memory => memory.id), [first.id, second.id]);
+});
