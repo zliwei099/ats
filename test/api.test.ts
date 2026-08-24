@@ -24,6 +24,45 @@ test('HTTP API completes the documented approval and execution loop', async () =
   await app.close();
 });
 
+test('HTTP failure and retry loop preserves evidence and enforces existing gates', async () => {
+  const store = new Store(); const app = buildServer(store);
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  const project = (await request('POST', '/projects', { name: 'retry' })).body;
+  const task = (await request('POST', `/projects/${project.id}/tasks`, { title: 'recoverable task' })).body;
+  const plan = (await request('POST', `/tasks/${task.id}/plans`, { body: 'approved work' })).body;
+  await request('POST', `/plans/${plan.id}/submit`, {}); await request('POST', `/plans/${plan.id}/approve`, { actor: 'reviewer' });
+  const first = (await request('POST', `/tasks/${task.id}/executions`, { provider: 'noop', actor: 'executor' })).body;
+  const failed = await request('POST', `/executions/${first.id}/fail`, { category: 'timeout', reason: 'loopback timeout', actor: 'executor' });
+  assert.equal(failed.response.statusCode, 200); assert.equal(failed.body.status, 'failed');
+  store.db.prepare("UPDATE plans SET status='submitted' WHERE id=?").run(plan.id);
+  const unapproved = await request('POST', `/executions/${first.id}/retry`, { actor: 'operator' });
+  assert.equal(unapproved.response.statusCode, 422); assert.equal(unapproved.body.error, 'PLAN_NOT_APPROVED');
+  store.db.prepare("UPDATE plans SET status='approved' WHERE id=?").run(plan.id);
+
+  const prerequisite = (await request('POST', `/projects/${project.id}/tasks`, { title: 'prerequisite' })).body;
+  const prerequisitePlan = (await request('POST', `/tasks/${prerequisite.id}/plans`, { body: 'approved prerequisite' })).body;
+  await request('POST', `/plans/${prerequisitePlan.id}/submit`, {}); await request('POST', `/plans/${prerequisitePlan.id}/approve`, { actor: 'reviewer' });
+  await request('POST', `/tasks/${task.id}/dependencies`, { dependsOnTaskId: prerequisite.id });
+  const dependencyBlocked = await request('POST', `/executions/${first.id}/retry`, { actor: 'operator' });
+  assert.equal(dependencyBlocked.response.statusCode, 422); assert.equal(dependencyBlocked.body.error, 'DEPENDENCIES_UNMET');
+  const prerequisiteExecution = (await request('POST', `/tasks/${prerequisite.id}/executions`, { provider: 'noop' })).body;
+  await request('POST', `/executions/${prerequisiteExecution.id}/finish`, {}); await request('POST', `/tasks/${prerequisite.id}/accept`, { actor: 'reviewer' });
+  const retry = await request('POST', `/executions/${first.id}/retry`, { actor: 'operator' });
+  assert.equal(retry.response.statusCode, 201); assert.equal(retry.body.retry_of_execution_id, first.id);
+  const duplicate = await request('POST', `/executions/${first.id}/retry`, { actor: 'operator' });
+  assert.equal(duplicate.response.statusCode, 422); assert.equal(duplicate.body.error, 'INVALID_STATE');
+  const evidence = await request('GET', `/tasks/${task.id}/evidence`);
+  const repeated = await request('GET', `/tasks/${task.id}/evidence`);
+  assert.deepEqual(repeated.body, evidence.body);
+  assert.deepEqual(evidence.body.executions.map((execution: Record<string, string>) => execution.id), [first.id, retry.body.id]);
+  assert.equal(evidence.body.executions[0].failure_category, 'timeout'); assert.equal(evidence.body.executions[0].failure_reason, 'loopback timeout');
+  assert.ok(evidence.body.audit_events.some((event: Record<string, any>) => event.action === 'execution_retried' && event.detail.originalExecutionId === first.id && event.detail.retryExecutionId === retry.body.id));
+  await app.close();
+});
+
 test('task evidence package joins approval, execution, transitions, and acceptance in a stable order', async () => {
   const app = buildServer(new Store());
   const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
@@ -108,7 +147,7 @@ test('dependency API rejects self references and cycles', async () => {
   await app.close();
 });
 
-test('loopback console lists accepted tasks and reads their existing evidence package', async () => {
+test('loopback console lists tasks and reads their existing evidence package', async () => {
   const app = buildServer(new Store());
   const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
     const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
@@ -124,15 +163,15 @@ test('loopback console lists accepted tasks and reads their existing evidence pa
   await request('POST', `/executions/${execution.id}/finish`, { actor: 'executor' });
   await request('POST', `/tasks/${task.id}/accept`, { actor: 'acceptor' });
 
-  const accepted = await request('GET', '/tasks?status=accepted');
-  assert.deepEqual(accepted.body.map((item: Record<string, string>) => item.id), [task.id]);
+  const tasks = await request('GET', '/tasks');
+  assert.deepEqual(tasks.body.map((item: Record<string, string>) => item.id), [task.id]);
   const page = await app.inject({ method: 'GET', url: '/console' });
   assert.equal(page.statusCode, 200);
   assert.match(page.headers['content-type'] ?? '', /text\/html/);
   assert.match(page.body, /任务证据包/);
   const script = await app.inject({ method: 'GET', url: '/console.js' });
   assert.equal(script.statusCode, 200);
-  assert.match(script.body, /\/tasks\?status=accepted/);
+  assert.match(script.body, /fetch\('\/tasks'\)/);
   assert.match(script.body, /\/evidence/);
   assert.doesNotMatch(script.body, /fetch\(['"]\/(?:projects|plans|executions)/);
   await app.close();

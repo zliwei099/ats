@@ -33,6 +33,21 @@ curl -sS http://127.0.0.1:3000/tasks/$task_id
 
 最后一个响应的 `status` 应为 `accepted`。SQLite schema 会在服务首次启动时自动创建；如果 `ATS_DB` 指向不存在的父目录，服务也会自动创建该目录。
 
+## 失败处置与受控重试
+
+活跃执行可显式写入稳定失败类别 `provider_error`、`timeout`、`validation_error`、`cancelled` 或 `unknown`，并提供简明原因。失败会结束该执行、将任务返回 `ready`，保留原执行与审计事件；不会覆盖历史记录。只有失败执行可重试：`POST /executions/:executionId/retry` 创建一个新的执行记录，并将其 `retry_of_execution_id` 关联到原执行。
+
+重试不会自动运行，也不绕过任何既有门禁：它重新检查已批准计划、全部依赖已解除、任务处于 `ready` 和单任务无活跃执行。任一条件不满足会以既有错误码拒绝，例如 `PLAN_NOT_APPROVED`、`DEPENDENCIES_UNMET` 或 `INVALID_STATE`。可在已启动的 loopback 服务上运行：
+
+```sh
+failed=$(curl -sS -X POST http://127.0.0.1:3000/executions/$execution_id/fail -H 'content-type: application/json' -d '{"category":"timeout","reason":"provider did not respond","actor":"executor"}')
+retry=$(curl -sS -X POST http://127.0.0.1:3000/executions/$execution_id/retry -H 'content-type: application/json' -d '{"actor":"operator"}')
+retry_id=$(node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id))' <<< "$retry")
+curl -sS http://127.0.0.1:3000/tasks/$task_id/evidence
+```
+
+`GET /tasks/:taskId/evidence` 以稳定顺序保留失败类别、原因、`retry_of_execution_id` 和 `failed` / `retry_created` / `retry_of` / `execution_retried` 审计事件。控制台现在可以选择所有任务，以只读方式展示失败和重试链路；不提供任何写入按钮。
+
 ## 任务依赖与阻塞
 
 创建前置任务和依赖任务后，以 `POST /tasks/:taskId/dependencies` 传入 `{ "dependsOnTaskId": "<前置任务ID>" }` 建立关系。仅同一项目内的任务可以关联；自依赖、重复关系和环状关系会被拒绝。依赖任务即使已有获批计划且处于 `ready`，只要前置任务未 `accepted`，`POST /tasks/:taskId/executions` 就返回 `422` 和 `DEPENDENCIES_UNMET`。前置任务经过既有审批、执行、验收闭环至 `accepted` 后，依赖自动解除，依赖任务仍需按原审批与状态机执行。
