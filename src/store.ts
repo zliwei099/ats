@@ -53,6 +53,18 @@ export type TaskRisk = {
   next_action: { code: string; condition: string };
 };
 
+export type QueueStatus = 'RISK_REQUIRES_ATTENTION' | 'ACTIVE_EXECUTION' | 'WAITING_APPROVAL' | 'DEPENDENCIES_UNMET' | 'READY_TO_START' | 'WAITING_ACCEPTANCE' | 'REPLAN_REQUIRED';
+export type ProjectQueueItem = {
+  task_id: string;
+  title: string;
+  owner: string;
+  task_status: string;
+  queue_status: QueueStatus;
+  reason_code: string;
+  trigger_facts: Record<string, unknown>;
+  next_action: { code: string; condition: string };
+};
+
 export type DecisionSource = { type: 'url' | 'task' | 'audit'; reference: string };
 
 export class DomainError extends Error {
@@ -291,6 +303,37 @@ export class Store {
     return (this.db.prepare('SELECT * FROM tasks WHERE project_id=? ORDER BY id').all(projectId) as RecordRow[])
       .map(task => this.riskForTask(task, now)).filter((risk): risk is TaskRisk => risk !== null)
       .sort((left, right) => severityOrder[left.severity] - severityOrder[right.severity] || left.last_activity_at.localeCompare(right.last_activity_at) || left.task_id.localeCompare(right.task_id));
+  }
+  projectQueue(projectId: string, now = this.clock()): ProjectQueueItem[] {
+    this.project(projectId);
+    const queueOrder: Record<QueueStatus, number> = {
+      RISK_REQUIRES_ATTENTION: 0, ACTIVE_EXECUTION: 1, WAITING_APPROVAL: 2,
+      DEPENDENCIES_UNMET: 3, READY_TO_START: 4, WAITING_ACCEPTANCE: 5, REPLAN_REQUIRED: 6
+    };
+    const riskSeverityOrder = { critical: 0, high: 1, medium: 2 };
+    const items = (this.db.prepare("SELECT * FROM tasks WHERE project_id=? AND status <> 'accepted' ORDER BY created_at, id").all(projectId) as RecordRow[])
+      .map(task => this.queueItem(task, now));
+    return items.sort((left, right) => queueOrder[left.queue_status] - queueOrder[right.queue_status]
+      || (left.queue_status === 'RISK_REQUIRES_ATTENTION' && right.queue_status === 'RISK_REQUIRES_ATTENTION'
+        ? riskSeverityOrder[String(left.trigger_facts.severity) as keyof typeof riskSeverityOrder] - riskSeverityOrder[String(right.trigger_facts.severity) as keyof typeof riskSeverityOrder]
+          || String(left.trigger_facts.last_activity_at).localeCompare(String(right.trigger_facts.last_activity_at))
+        : 0)
+      || left.task_id.localeCompare(right.task_id));
+  }
+  private queueItem(task: RecordRow, now: Date): ProjectQueueItem {
+    const taskId = String(task.id); const base = { task_id: taskId, title: String(task.title), owner: String(task.owner), task_status: String(task.status) };
+    const risk = this.riskForTask(task, now);
+    if (risk) return { ...base, queue_status: 'RISK_REQUIRES_ATTENTION', reason_code: risk.risk_code, trigger_facts: { ...risk.trigger_facts, severity: risk.severity, last_activity_at: risk.last_activity_at }, next_action: risk.next_action };
+    const view = this.dependencyView(taskId);
+    const active = view.blocking_reasons.find(reason => reason.code === 'ACTIVE_EXECUTION');
+    if (active) return { ...base, queue_status: 'ACTIVE_EXECUTION', reason_code: 'ACTIVE_EXECUTION', trigger_facts: { execution_id: active.execution_id, task_status: task.status }, next_action: { code: 'WAIT_FOR_ACTIVE_EXECUTION', condition: 'The existing active execution must finish or fail before another execution can start.' } };
+    const approval = view.blocking_reasons.find(reason => reason.code === 'PLAN_NOT_APPROVED');
+    if (approval) return { ...base, queue_status: 'WAITING_APPROVAL', reason_code: 'PLAN_NOT_APPROVED', trigger_facts: { plan_status: approval.status, task_status: task.status }, next_action: { code: 'SUBMIT_OR_APPROVE_PLAN', condition: 'A plan must be approved before the task can become ready.' } };
+    const dependency = view.blocking_reasons.find(reason => reason.code.startsWith('PREREQUISITE_'));
+    if (dependency) return { ...base, queue_status: 'DEPENDENCIES_UNMET', reason_code: dependency.code, trigger_facts: { prerequisite_task_id: dependency.task_id, dependency_id: dependency.dependency_id, prerequisite_status: dependency.status, execution_id: dependency.execution_id }, next_action: { code: 'SATISFY_PREREQUISITE', condition: 'Every prerequisite must be accepted before this task can start.' } };
+    if (task.status === 'ready' && view.can_start) return { ...base, queue_status: 'READY_TO_START', reason_code: 'ALL_START_CONDITIONS_MET', trigger_facts: { plan_approved: true, prerequisites_satisfied: true }, next_action: { code: 'START_EXECUTION', condition: 'Use the existing execution endpoint when work is ready to begin.' } };
+    if (task.status === 'awaiting_acceptance') return { ...base, queue_status: 'WAITING_ACCEPTANCE', reason_code: 'ACCEPTANCE_REQUIRED', trigger_facts: { task_status: task.status }, next_action: { code: 'REVIEW_AND_ACCEPT', condition: 'The completed execution must be accepted or rejected.' } };
+    return { ...base, queue_status: 'REPLAN_REQUIRED', reason_code: 'TASK_NOT_READY', trigger_facts: { task_status: task.status, blocking_reasons: view.blocking_reasons.map(reason => reason.code) }, next_action: { code: 'RESTORE_READY_STATE', condition: 'Resolve the existing workflow state before starting work.' } };
   }
   createPlan(taskId: string, body: string, actor = 'system') {
     this.task(taskId); const id = randomUUID(); const createdAt = this.now();

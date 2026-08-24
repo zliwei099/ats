@@ -102,7 +102,9 @@ curl -sS http://127.0.0.1:3000/tasks/$task_id/evidence
 
 启动服务并按上面的 API 闭环创建任务后，在浏览器打开 `http://127.0.0.1:3000/console`。下拉框列出所有任务；选择任务即可读取既有 `GET /tasks/:taskId/evidence`、`GET /tasks/:taskId/dependency-status` 和 `GET /tasks/:taskId/risk`，按稳定顺序展示时效风险、处置条件、直接/反向依赖、机器可读阻塞原因、下一步执行条件、当前负责人、责任链、计划决策人、执行责任人、状态迁移、验收人和审计记录。也可以使用 `http://127.0.0.1:3000/console?taskId=<任务ID>` 直接打开某个任务。
 
-该控制台仅调用 `GET /tasks`、`GET /tasks/:taskId/evidence` 和 `GET /tasks/:taskId/dependency-status`，不提供任何写入操作，服务仍只监听 `127.0.0.1`。
+该控制台还会调用 `GET /projects/:projectId/queue`，以稳定顺序展示所选任务所在项目的全部未完成任务：`RISK_REQUIRES_ATTENTION`、`ACTIVE_EXECUTION`、`WAITING_APPROVAL`、`DEPENDENCIES_UNMET`、`READY_TO_START` 及其余工作流待处置状态。每项包含当前负责人、机器可读原因代码、触发事实和可执行下一步；风险优先于其他分类，随后是活跃执行、审批、依赖和可开始任务，同类以任务 ID 稳定排序。已 `accepted` 的任务不在队列内；不存在项目返回 `404 NOT_FOUND`。
+
+该控制台仅调用只读 GET API，不提供任何写入操作，服务仍只监听 `127.0.0.1`。
 
 ## 任务时效风险与升级信号
 

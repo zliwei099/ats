@@ -22,8 +22,8 @@ export const consoleHtml = `<!doctype html>
   </style>
 </head>
 <body>
-  <h1>任务证据包</h1>
-  <p class="subtle">本地只读视图：依赖关系、阻塞原因、可执行条件、负责人交接、计划决定、执行失败与重试、状态迁移、验收和审计记录。</p>
+  <h1>项目任务队列与任务证据包</h1>
+  <p class="subtle">本地只读视图：项目级就绪度、风险、依赖关系、负责人交接、计划决定、执行失败与重试、状态迁移、验收和审计记录。</p>
   <div class="toolbar"><select id="task-select" aria-label="任务"><option value="">选择任务</option></select><button id="reload" type="button">刷新</button></div>
   <p id="error" role="alert"></p><main id="content" aria-live="polite"><p class="empty">正在加载任务…</p></main>
   <script type="module" src="/console.js"></script>
@@ -65,6 +65,9 @@ function renderRisk(result) {
     ? details([['风险代码', risk.risk_code], ['严重度', risk.severity], ['负责人', risk.owner], ['最后活动', risk.last_activity_at], ['触发事实', JSON.stringify(risk.trigger_facts)], ['下一步', risk.next_action.code], ['处置条件', risk.next_action.condition]])
     : '<p class="empty">当前未检测到时效风险。</p>');
 }
+function renderQueue(items) {
+  return section('项目执行队列（只读）', rows(items, [{ label: '队列状态', key: 'queue_status' }, { label: '任务', html: item => text(item.title) + ' / ' + text(item.task_id) }, { label: '负责人', key: 'owner' }, { label: '任务状态', key: 'task_status' }, { label: '原因代码', key: 'reason_code' }, { label: '触发事实', html: item => '<code>' + text(JSON.stringify(item.trigger_facts)) + '</code>' }, { label: '下一步', html: item => text(item.next_action.code) + '：' + text(item.next_action.condition) }]));
+}
 async function loadEvidence() {
   error.textContent = '';
   if (!select.value) { content.innerHTML = '<p class="empty">选择一个任务以查看证据包。</p>'; return; }
@@ -72,7 +75,10 @@ async function loadEvidence() {
     const taskId = encodeURIComponent(select.value);
     const [evidenceResponse, dependencyResponse, riskResponse] = await Promise.all([fetch('/tasks/' + taskId + '/evidence'), fetch('/tasks/' + taskId + '/dependency-status'), fetch('/tasks/' + taskId + '/risk')]);
     if (!evidenceResponse.ok || !dependencyResponse.ok || !riskResponse.ok) throw new Error('请求失败（HTTP ' + (!evidenceResponse.ok ? evidenceResponse.status : !dependencyResponse.ok ? dependencyResponse.status : riskResponse.status) + '）');
-    render(await evidenceResponse.json()); content.insertAdjacentHTML('afterbegin', renderRisk(await riskResponse.json())); content.insertAdjacentHTML('afterbegin', renderDependencyStatus(await dependencyResponse.json()));
+    const evidence = await evidenceResponse.json();
+    const queueResponse = await fetch('/projects/' + encodeURIComponent(evidence.task.project_id) + '/queue');
+    if (!queueResponse.ok) throw new Error('无法读取项目执行队列（HTTP ' + queueResponse.status + '）');
+    render(evidence); content.insertAdjacentHTML('afterbegin', renderRisk(await riskResponse.json())); content.insertAdjacentHTML('afterbegin', renderDependencyStatus(await dependencyResponse.json())); content.insertAdjacentHTML('afterbegin', renderQueue(await queueResponse.json()));
   } catch (reason) { error.textContent = reason instanceof Error ? reason.message : '无法加载证据包'; }
 }
 async function loadTasks() {
