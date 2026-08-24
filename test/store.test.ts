@@ -11,6 +11,30 @@ test('execution cannot start before plan approval', () => {
   const plan = store.createPlan(taskId, 'work'); store.submitPlan(String(plan.id));
   mustThrow(() => store.startExecution(taskId, 'noop'), 'PLAN_NOT_APPROVED');
 });
+test('plan history preserves ordered decisions and only the current approved version can execute', () => {
+  const { store, taskId } = setup();
+  const first = store.createPlan(taskId, 'first proposal', 'planner-a');
+  store.submitPlan(String(first.id), 'planner-a');
+  const rejected = store.decidePlan(String(first.id), false, 'reviewer-a', 'needs an explicit rollback');
+  const second = store.createPlan(taskId, 'second proposal', 'planner-b');
+  store.submitPlan(String(second.id), 'planner-b');
+  const approved = store.decidePlan(String(second.id), true, 'reviewer-b');
+  const history = store.planHistory(taskId);
+  assert.deepEqual(history.map(plan => [plan.version, plan.status, plan.display_status, plan.is_current]), [[1, 'rejected', 'superseded', false], [2, 'approved', 'approved', true]]);
+  assert.equal(history[0].created_by, 'planner-a'); assert.equal(history[0].decided_by, 'reviewer-a'); assert.equal(history[0].rejection_reason, 'needs an explicit rollback');
+  assert.equal(store.evidencePackage(taskId).plan?.id, approved.id);
+  assert.equal(store.evidencePackage(taskId).plan_history.length, 2);
+  assert.doesNotThrow(() => store.startExecution(taskId, 'noop'));
+  mustThrow(() => store.decidePlan(String(first.id), true, 'reviewer-c'), 'INVALID_STATE');
+  mustThrow(() => store.createPlan('missing', 'no task'), 'NOT_FOUND');
+});
+test('a newer unapproved plan closes the execution gate even if an older plan was approved', () => {
+  const { store, taskId } = setup();
+  approve(store, taskId);
+  const newer = store.createPlan(taskId, 'needs review');
+  assert.equal(newer.version, 2);
+  mustThrow(() => store.startExecution(taskId, 'noop'), 'PLAN_NOT_APPROVED');
+});
 test('illegal task transitions are rejected', () => {
   const { store, taskId } = setup();
   mustThrow(() => store.transitionTask(taskId, 'accepted'), 'INVALID_STATE');

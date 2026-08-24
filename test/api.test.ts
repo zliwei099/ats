@@ -24,6 +24,36 @@ test('HTTP API completes the documented approval and execution loop', async () =
   await app.close();
 });
 
+test('plan history API provides a stable versioned approval trail and read-only console rendering', async () => {
+  const app = buildServer(new Store());
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  const project = (await request('POST', '/projects', { name: 'versions' })).body;
+  const task = (await request('POST', `/projects/${project.id}/tasks`, { title: 'ship' })).body;
+  const first = (await request('POST', `/tasks/${task.id}/plans`, { body: 'first', actor: 'planner-a' })).body;
+  await request('POST', `/plans/${first.id}/submit`, { actor: 'planner-a' });
+  const rejected = await request('POST', `/plans/${first.id}/reject`, { actor: 'reviewer-a', reason: 'missing rollback' });
+  assert.equal(rejected.response.statusCode, 200);
+  const second = (await request('POST', `/tasks/${task.id}/plans`, { body: 'second', actor: 'planner-b' })).body;
+  await request('POST', `/plans/${second.id}/submit`, { actor: 'planner-b' }); await request('POST', `/plans/${second.id}/approve`, { actor: 'reviewer-b' });
+  const history = await request('GET', `/tasks/${task.id}/plans`);
+  assert.equal(history.response.statusCode, 200);
+  assert.deepEqual((history.body as unknown as Array<Record<string, any>>).map(plan => [plan.version, plan.is_current, plan.display_status, plan.rejection_reason]), [[1, false, 'superseded', 'missing rollback'], [2, true, 'approved', null]]);
+  const evidence = await request('GET', `/tasks/${task.id}/evidence`);
+  assert.equal(evidence.body.plan.id, second.id); assert.deepEqual(evidence.body.plan_history, history.body);
+  const execution = await request('POST', `/tasks/${task.id}/executions`, { provider: 'noop' });
+  assert.equal(execution.response.statusCode, 201);
+  const missing = await request('GET', '/tasks/missing/plans');
+  assert.equal(missing.response.statusCode, 404); assert.equal(missing.body.error, 'NOT_FOUND');
+  const invalid = await request('POST', `/plans/${second.id}/reject`, { actor: 'reviewer-c', reason: 'too late' });
+  assert.equal(invalid.response.statusCode, 422); assert.equal(invalid.body.error, 'INVALID_STATE');
+  const script = await app.inject({ method: 'GET', url: '/console.js' });
+  assert.match(script.body, /计划版本与决定历史/); assert.doesNotMatch(script.body, /plans.*POST/);
+  await app.close();
+});
+
 test('risk APIs expose deterministic due and inactivity escalation signals without reporting completed tasks', async () => {
   const observedAt = '2026-08-24T12:00:00.000Z';
   const app = buildServer(new Store(':memory:', () => new Date(observedAt)));

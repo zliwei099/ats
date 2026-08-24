@@ -25,6 +25,7 @@ export type EvidencePackage = {
   dependencies: Array<RecordRow>;
   blocked_dependents: Array<RecordRow>;
   plan: RecordRow | null;
+  plan_history: Array<RecordRow>;
   executions: Array<RecordRow & { started_by: string | null; finished_by: string | null }>;
   status_transitions: Array<{ event_id: string; from: string; to: string; actor: string; created_at: string }>;
   acceptance: { event_id: string; actor: string; created_at: string } | null;
@@ -85,7 +86,7 @@ export class Store {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL, status TEXT NOT NULL, owner TEXT NOT NULL, created_at TEXT NOT NULL, due_at TEXT);
-      CREATE TABLE IF NOT EXISTS plans (id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id), body TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, created_at TEXT NOT NULL, decided_at TEXT);
+      CREATE TABLE IF NOT EXISTS plans (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), version INTEGER NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, created_by TEXT NOT NULL, decided_by TEXT, rejection_reason TEXT, created_at TEXT NOT NULL, decided_at TEXT, UNIQUE(task_id, version));
       CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), provider TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT, failure_category TEXT, failure_reason TEXT, retry_of_execution_id TEXT REFERENCES executions(id));
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_execution_per_task ON executions(task_id) WHERE status = 'active';
       CREATE TABLE IF NOT EXISTS task_dependencies (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), depends_on_task_id TEXT NOT NULL REFERENCES tasks(id), created_at TEXT NOT NULL, resolved_at TEXT, UNIQUE(task_id, depends_on_task_id), CHECK(task_id <> depends_on_task_id));
@@ -106,6 +107,20 @@ export class Store {
       CREATE INDEX IF NOT EXISTS decision_memories_project_status_created ON decision_memories(project_id, status, created_at, id);
       CREATE TABLE IF NOT EXISTS audit_events (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, actor TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL, sequence INTEGER);
     `);
+    const planColumns = this.db.prepare('PRAGMA table_info(plans)').all() as Array<{ name: string }>;
+    // Older local databases used one plan per task. Rebuild that table once so
+    // its existing record becomes version 1 without losing an approval decision.
+    if (!planColumns.some(column => column.name === 'version')) {
+      this.db.exec(`
+        BEGIN;
+        ALTER TABLE plans RENAME TO plans_legacy;
+        CREATE TABLE plans (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), version INTEGER NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, created_by TEXT NOT NULL, decided_by TEXT, rejection_reason TEXT, created_at TEXT NOT NULL, decided_at TEXT, UNIQUE(task_id, version));
+        INSERT INTO plans (id, task_id, version, body, status, created_by, decided_by, rejection_reason, created_at, decided_at)
+          SELECT id, task_id, 1, body, status, 'system', decided_by, NULL, created_at, decided_at FROM plans_legacy;
+        DROP TABLE plans_legacy;
+        COMMIT;
+      `);
+    }
     const columns = this.db.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     if (!columns.some(column => column.name === 'sequence')) this.db.exec('ALTER TABLE audit_events ADD COLUMN sequence INTEGER');
     const taskColumns = this.db.prepare('PRAGMA table_info(tasks)').all() as Array<{ name: string }>;
@@ -231,7 +246,7 @@ export class Store {
     const task = this.task(taskId);
     const prerequisites = this.dependencies(taskId);
     const dependents = this.blockedDependents(taskId);
-    const plan = this.db.prepare('SELECT status FROM plans WHERE task_id=?').get(taskId) as { status: PlanStatus } | undefined;
+    const plan = this.currentPlan(taskId) as { status: PlanStatus } | undefined;
     const activeExecution = this.db.prepare("SELECT id FROM executions WHERE task_id=? AND status='active' ORDER BY created_at, id LIMIT 1").get(taskId) as { id: string } | undefined;
     const blockingReasons: DependencyView['blocking_reasons'] = [];
     const conditions: DependencyView['next_executable_conditions'] = [];
@@ -277,9 +292,9 @@ export class Store {
     return this.db.prepare(status ? 'SELECT * FROM tasks WHERE status=? ORDER BY created_at, id' : 'SELECT * FROM tasks ORDER BY created_at, id').all(...(status ? [status] : [])) as RecordRow[];
   }
   private taskActivity(task: RecordRow) {
-    const plan = this.db.prepare('SELECT id FROM plans WHERE task_id=?').get(String(task.id)) as { id: string } | undefined;
+    const plans = this.db.prepare('SELECT id FROM plans WHERE task_id=?').all(String(task.id)) as Array<{ id: string }>;
     const executions = this.db.prepare('SELECT id FROM executions WHERE task_id=?').all(String(task.id)) as Array<{ id: string }>;
-    const ids = [String(task.id), ...(plan ? [plan.id] : []), ...executions.map(execution => execution.id)];
+    const ids = [String(task.id), ...plans.map(plan => plan.id), ...executions.map(execution => execution.id)];
     const placeholders = ids.map(() => '?').join(', ');
     return this.db.prepare(`SELECT created_at FROM audit_events WHERE entity_id IN (${placeholders}) ORDER BY created_at DESC, sequence DESC, id DESC LIMIT 1`).get(...ids) as { created_at: string } | undefined;
   }
@@ -336,19 +351,33 @@ export class Store {
     return { ...base, queue_status: 'REPLAN_REQUIRED', reason_code: 'TASK_NOT_READY', trigger_facts: { task_status: task.status, blocking_reasons: view.blocking_reasons.map(reason => reason.code) }, next_action: { code: 'RESTORE_READY_STATE', condition: 'Resolve the existing workflow state before starting work.' } };
   }
   createPlan(taskId: string, body: string, actor = 'system') {
-    this.task(taskId); const id = randomUUID(); const createdAt = this.now();
-    try { this.db.prepare('INSERT INTO plans (id, task_id, body, status, created_at) VALUES (?, ?, ?, ?, ?)').run(id, taskId, body, 'draft', createdAt); }
-    catch { throw new DomainError('task already has a plan', 'CONFLICT'); }
-    this.audit('plan', id, 'created', actor, { taskId }); return this.plan(id);
+    this.task(taskId);
+    if (!body?.trim()) throw new DomainError('plan body is required', 'INVALID_PLAN');
+    const creator = actor?.trim() || 'system'; const id = randomUUID(); const createdAt = this.now();
+    const version = Number((this.db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS version FROM plans WHERE task_id=?').get(taskId) as { version: number }).version);
+    this.db.prepare('INSERT INTO plans (id, task_id, version, body, status, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, taskId, version, body.trim(), 'draft', creator, createdAt);
+    this.audit('plan', id, 'created', creator, { taskId, version }); return this.plan(id);
   }
   plan(id: string) { const row = this.db.prepare('SELECT * FROM plans WHERE id = ?').get(id) as RecordRow | undefined; if (!row) throw new DomainError('plan not found', 'NOT_FOUND'); return row; }
+  private currentPlan(taskId: string) {
+    return this.db.prepare('SELECT * FROM plans WHERE task_id=? ORDER BY version DESC, rowid DESC LIMIT 1').get(taskId) as RecordRow | undefined;
+  }
+  planHistory(taskId: string): Array<RecordRow & { is_current: boolean; display_status: string }> {
+    this.task(taskId);
+    const current = this.currentPlan(taskId);
+    return (this.db.prepare('SELECT * FROM plans WHERE task_id=? ORDER BY version ASC, rowid ASC').all(taskId) as RecordRow[])
+      .map(plan => ({ ...plan, is_current: plan.id === current?.id, display_status: String(plan.id) === String(current?.id) ? String(plan.status) : 'superseded' }));
+  }
   submitPlan(id: string, actor = 'system') { return this.changePlan(id, 'submitted', actor); }
-  decidePlan(id: string, approved: boolean, actor: string) {
+  decidePlan(id: string, approved: boolean, actor: string, rejectionReason?: string) {
     const plan = this.plan(id); if (plan.status !== 'submitted') throw new DomainError('only submitted plans may be decided', 'INVALID_STATE');
+    if (!actor?.trim()) throw new DomainError('plan decision actor is required', 'INVALID_PLAN');
     const status: PlanStatus = approved ? 'approved' : 'rejected';
-    this.db.prepare('UPDATE plans SET status=?, decided_by=?, decided_at=? WHERE id=?').run(status, actor, this.now(), id);
-    if (approved) this.transitionTask(String(plan.task_id), 'ready', actor);
-    this.audit('plan', id, approved ? 'approved' : 'rejected', actor, {}); return this.plan(id);
+    const reason = rejectionReason?.trim() || null;
+    if (approved && reason) throw new DomainError('approved plans cannot have a rejection reason', 'INVALID_PLAN');
+    this.db.prepare('UPDATE plans SET status=?, decided_by=?, rejection_reason=?, decided_at=? WHERE id=?').run(status, actor.trim(), approved ? null : reason, this.now(), id);
+    if (approved && this.task(String(plan.task_id)).status === 'planned') this.transitionTask(String(plan.task_id), 'ready', actor.trim());
+    this.audit('plan', id, approved ? 'approved' : 'rejected', actor.trim(), approved ? {} : { reason }); return this.plan(id);
   }
   private changePlan(id: string, target: PlanStatus, actor: string) {
     const plan = this.plan(id); if (plan.status !== 'draft' || target !== 'submitted') throw new DomainError('invalid plan transition', 'INVALID_STATE');
@@ -371,8 +400,8 @@ export class Store {
   }
   startExecution(taskId: string, provider: string, actor = 'system', retryOfExecutionId?: string) {
     const task = this.task(taskId);
-    const plan = this.db.prepare("SELECT * FROM plans WHERE task_id=? AND status='approved'").get(taskId);
-    if (!plan) throw new DomainError('execution requires an approved plan', 'PLAN_NOT_APPROVED');
+    const plan = this.currentPlan(taskId);
+    if (!plan || plan.status !== 'approved') throw new DomainError('execution requires the current plan to be approved', 'PLAN_NOT_APPROVED');
     const unmet = this.dependencies(taskId).filter(dependency => !dependency.satisfied);
     if (unmet.length) throw new DomainError(`execution is blocked by ${unmet.map(dependency => String(dependency.depends_on_task_id)).join(', ')}`, 'DEPENDENCIES_UNMET');
     if (task.status !== 'ready') throw new DomainError('task must be ready before execution', 'INVALID_STATE');
@@ -409,11 +438,12 @@ export class Store {
   auditEvents(entityId?: string) { return this.db.prepare(entityId ? 'SELECT * FROM audit_events WHERE entity_id=? ORDER BY sequence IS NULL, sequence, created_at, id' : 'SELECT * FROM audit_events ORDER BY sequence IS NULL, sequence, created_at, id').all(...(entityId ? [entityId] : [])); }
   evidencePackage(taskId: string): EvidencePackage {
     const task = this.task(taskId);
-    const plan = this.db.prepare('SELECT * FROM plans WHERE task_id=?').get(taskId) as RecordRow | undefined;
+    const plan = this.currentPlan(taskId);
+    const planHistory = this.planHistory(taskId);
     // `created_at` can collide in a fast local workflow; rowid preserves the
     // immutable SQLite insertion order without using a random UUID as a tie-breaker.
     const executions = this.db.prepare('SELECT * FROM executions WHERE task_id=? ORDER BY created_at, rowid').all(taskId) as RecordRow[];
-    const entityIds = [taskId, ...(plan ? [String(plan.id)] : []), ...executions.map(execution => String(execution.id))];
+    const entityIds = [taskId, ...planHistory.map(item => String(item.id)), ...executions.map(execution => String(execution.id))];
     const placeholders = entityIds.map(() => '?').join(', ');
     const events = this.db.prepare(`SELECT * FROM audit_events WHERE entity_id IN (${placeholders}) ORDER BY sequence IS NULL, sequence, created_at, id`).all(...entityIds) as AuditEventRow[];
     const decisionMemories = this.decisionMemories(String(task.project_id), 'all');
@@ -441,6 +471,7 @@ export class Store {
       dependencies: this.dependencies(taskId),
       blocked_dependents: this.blockedDependents(taskId),
       plan: plan ?? null,
+      plan_history: planHistory,
       executions: executions.map(execution => ({
         ...execution,
         started_by: eventFor(String(execution.id), 'started')?.actor ?? null,
