@@ -48,3 +48,26 @@ test('approval, execution, and acceptance state flow is audited', () => {
   const execution = store.startExecution(taskId, 'noop'); store.finishExecution(String(execution.id)); store.transitionTask(taskId, 'accepted', 'reviewer');
   assert.equal(store.task(taskId).status, 'accepted'); assert.ok(store.auditEvents(taskId).length >= 4);
 });
+test('failed executions retain their reason and retry only creates a linked new attempt', () => {
+  const { store, taskId } = setup(); approve(store, taskId);
+  const first = store.startExecution(taskId, 'noop', 'executor');
+  const failed = store.failExecution(String(first.id), 'timeout', 'provider did not respond', 'executor');
+  assert.equal(failed.status, 'failed'); assert.equal(failed.failure_category, 'timeout'); assert.equal(store.task(taskId).status, 'ready');
+  const retry = store.retryExecution(String(first.id), 'operator');
+  assert.notEqual(retry.id, first.id); assert.equal(retry.retry_of_execution_id, first.id); assert.equal(retry.status, 'active');
+  mustThrow(() => store.retryExecution(String(first.id), 'operator'), 'INVALID_STATE');
+  const evidence = store.evidencePackage(taskId);
+  assert.deepEqual(evidence.executions.map(execution => execution.id), [first.id, retry.id]);
+  assert.ok(evidence.audit_events.some((event: any) => event.action === 'failed' && event.detail.reason === 'provider did not respond'));
+  assert.ok(evidence.audit_events.some((event: any) => event.action === 'execution_retried' && event.detail.retryExecutionId === retry.id));
+});
+test('retry preserves approval and dependency gates', () => {
+  const { store, taskId } = setup(); approve(store, taskId);
+  const first = store.startExecution(taskId, 'noop'); store.failExecution(String(first.id), 'unknown', 'temporary failure');
+  store.db.prepare("UPDATE plans SET status='submitted' WHERE task_id=?").run(taskId);
+  mustThrow(() => store.retryExecution(String(first.id)), 'PLAN_NOT_APPROVED');
+  store.db.prepare("UPDATE plans SET status='approved' WHERE task_id=?").run(taskId);
+  const prerequisite = String(store.createTask(String(store.task(taskId).project_id), 'prerequisite').id);
+  approve(store, prerequisite); store.addDependency(taskId, prerequisite);
+  mustThrow(() => store.retryExecution(String(first.id)), 'DEPENDENCIES_UNMET');
+});

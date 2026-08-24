@@ -5,6 +5,7 @@ import { dirname } from 'node:path';
 
 export type PlanStatus = 'draft' | 'submitted' | 'approved' | 'rejected';
 export type TaskStatus = 'planned' | 'ready' | 'executing' | 'awaiting_acceptance' | 'accepted' | 'rejected';
+export type FailureCategory = 'provider_error' | 'timeout' | 'validation_error' | 'cancelled' | 'unknown';
 type RecordRow = Record<string, unknown>;
 
 type AuditEventRow = RecordRow & {
@@ -37,7 +38,7 @@ export class DomainError extends Error {
 }
 
 const transitions: Record<TaskStatus, TaskStatus[]> = {
-  planned: ['ready'], ready: ['executing'], executing: ['awaiting_acceptance'],
+  planned: ['ready'], ready: ['executing'], executing: ['awaiting_acceptance', 'ready'],
   awaiting_acceptance: ['accepted', 'rejected'], accepted: [], rejected: ['ready']
 };
 
@@ -51,7 +52,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS plans (id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id), body TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, created_at TEXT NOT NULL, decided_at TEXT);
-      CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), provider TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT);
+      CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), provider TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT, failure_category TEXT, failure_reason TEXT, retry_of_execution_id TEXT REFERENCES executions(id));
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_execution_per_task ON executions(task_id) WHERE status = 'active';
       CREATE TABLE IF NOT EXISTS task_dependencies (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), depends_on_task_id TEXT NOT NULL REFERENCES tasks(id), created_at TEXT NOT NULL, resolved_at TEXT, UNIQUE(task_id, depends_on_task_id), CHECK(task_id <> depends_on_task_id));
       CREATE INDEX IF NOT EXISTS task_dependencies_depends_on ON task_dependencies(depends_on_task_id);
@@ -72,6 +73,10 @@ export class Store {
     `);
     const columns = this.db.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     if (!columns.some(column => column.name === 'sequence')) this.db.exec('ALTER TABLE audit_events ADD COLUMN sequence INTEGER');
+    const executionColumns = this.db.prepare('PRAGMA table_info(executions)').all() as Array<{ name: string }>;
+    if (!executionColumns.some(column => column.name === 'failure_category')) this.db.exec('ALTER TABLE executions ADD COLUMN failure_category TEXT');
+    if (!executionColumns.some(column => column.name === 'failure_reason')) this.db.exec('ALTER TABLE executions ADD COLUMN failure_reason TEXT');
+    if (!executionColumns.some(column => column.name === 'retry_of_execution_id')) this.db.exec('ALTER TABLE executions ADD COLUMN retry_of_execution_id TEXT');
   }
   private now() { return new Date().toISOString(); }
   private audit(entityType: string, entityId: string, action: string, actor: string, detail: unknown) {
@@ -210,7 +215,7 @@ export class Store {
     }
     return this.task(id);
   }
-  startExecution(taskId: string, provider: string, actor = 'system') {
+  startExecution(taskId: string, provider: string, actor = 'system', retryOfExecutionId?: string) {
     const task = this.task(taskId);
     const plan = this.db.prepare("SELECT * FROM plans WHERE task_id=? AND status='approved'").get(taskId);
     if (!plan) throw new DomainError('execution requires an approved plan', 'PLAN_NOT_APPROVED');
@@ -218,14 +223,32 @@ export class Store {
     if (unmet.length) throw new DomainError(`execution is blocked by ${unmet.map(dependency => String(dependency.depends_on_task_id)).join(', ')}`, 'DEPENDENCIES_UNMET');
     if (task.status !== 'ready') throw new DomainError('task must be ready before execution', 'INVALID_STATE');
     const id = randomUUID();
-    try { this.db.prepare('INSERT INTO executions (id, task_id, provider, status, created_at) VALUES (?, ?, ?, ?, ?)').run(id, taskId, provider, 'active', this.now()); }
+    try { this.db.prepare('INSERT INTO executions (id, task_id, provider, status, created_at, retry_of_execution_id) VALUES (?, ?, ?, ?, ?, ?)').run(id, taskId, provider, 'active', this.now(), retryOfExecutionId ?? null); }
     catch { throw new DomainError('task already has an active execution', 'EXECUTION_ACTIVE'); }
-    this.transitionTask(taskId, 'executing', actor); this.audit('execution', id, 'started', actor, { taskId, provider }); return this.execution(id);
+    this.transitionTask(taskId, 'executing', actor); this.audit('execution', id, 'started', actor, { taskId, provider, retryOfExecutionId: retryOfExecutionId ?? null }); return this.execution(id);
   }
   finishExecution(id: string, actor = 'system') {
     const execution = this.execution(id); if (execution.status !== 'active') throw new DomainError('execution is not active', 'INVALID_STATE');
     this.db.prepare("UPDATE executions SET status='completed', finished_at=? WHERE id=?").run(this.now(), id);
     this.transitionTask(String(execution.task_id), 'awaiting_acceptance', actor); this.audit('execution', id, 'finished', actor, {}); return this.execution(id);
+  }
+  failExecution(id: string, category: FailureCategory, reason: string, actor = 'system') {
+    if (!['provider_error', 'timeout', 'validation_error', 'cancelled', 'unknown'].includes(category)) throw new DomainError('failure category is invalid', 'INVALID_FAILURE');
+    if (!reason?.trim()) throw new DomainError('failure reason is required', 'INVALID_FAILURE');
+    const execution = this.execution(id); if (execution.status !== 'active') throw new DomainError('execution is not active', 'INVALID_STATE');
+    this.db.prepare("UPDATE executions SET status='failed', finished_at=?, failure_category=?, failure_reason=? WHERE id=?").run(this.now(), category, reason.trim(), id);
+    this.transitionTask(String(execution.task_id), 'ready', actor);
+    this.audit('execution', id, 'failed', actor, { taskId: execution.task_id, category, reason: reason.trim() });
+    return this.execution(id);
+  }
+  retryExecution(id: string, actor = 'system') {
+    const original = this.execution(id);
+    if (original.status !== 'failed') throw new DomainError('only failed executions may be retried', 'INVALID_STATE');
+    const retry = this.startExecution(String(original.task_id), String(original.provider), actor, id);
+    this.audit('execution', id, 'retry_created', actor, { taskId: original.task_id, retryExecutionId: retry.id });
+    this.audit('execution', String(retry.id), 'retry_of', actor, { taskId: original.task_id, originalExecutionId: id });
+    this.audit('task', String(original.task_id), 'execution_retried', actor, { originalExecutionId: id, retryExecutionId: retry.id });
+    return retry;
   }
   execution(id: string) { const row = this.db.prepare('SELECT * FROM executions WHERE id=?').get(id) as RecordRow | undefined; if (!row) throw new DomainError('execution not found', 'NOT_FOUND'); return row; }
   auditEvents(entityId?: string) { return this.db.prepare(entityId ? 'SELECT * FROM audit_events WHERE entity_id=? ORDER BY sequence IS NULL, sequence, created_at, id' : 'SELECT * FROM audit_events ORDER BY sequence IS NULL, sequence, created_at, id').all(...(entityId ? [entityId] : [])); }
