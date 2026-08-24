@@ -81,3 +81,41 @@ curl -sS 'http://127.0.0.1:3000/projects/'$project_id'/decision-memories?status=
 ```
 
 替代关系只能连接同一项目内的两条不同决策；无效项目、无效来源或跨项目替代均被拒绝。所有列表按 `created_at, id` 稳定排序。任务证据包会只读包含该任务所属项目的完整决策历史；启动服务后打开 `http://127.0.0.1:3000/console`，选择已验收任务即可查看，控制台不提供决策或状态机的写入口。
+
+## ATS-30 整合复验
+
+候选分支须同时包含依赖门禁和项目决策记忆。以下命令在一个全新的 loopback 实例中覆盖两项功能；其中 `blocked` 的 HTTP 状态应为 `422` 且错误码为 `DEPENDENCIES_UNMET`，而 `allowed` 应为 `201`。脚本也验证决策替代后默认列表仅返回活跃记录、`status=all` 保留完整历史。
+
+```sh
+ATS_DB=./ats-30-verify.sqlite PORT=3100 npm run start &
+server_pid=$!
+trap 'kill "$server_pid"; rm -f ./ats-30-verify.sqlite ./ats-30-blocked.json' EXIT
+base=http://127.0.0.1:3100
+until curl -fsS "$base/health" >/dev/null; do sleep 0.1; done
+
+post() { curl -sS -X POST "$1" -H 'content-type: application/json' -d "$2"; }
+id() { node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))'; }
+project_id=$(post "$base/projects" '{"name":"ATS-30 verification"}' | id)
+prerequisite_id=$(post "$base/projects/$project_id/tasks" '{"title":"prerequisite"}' | id)
+dependent_id=$(post "$base/projects/$project_id/tasks" '{"title":"dependent"}' | id)
+for task_id in "$prerequisite_id" "$dependent_id"; do
+  plan_id=$(post "$base/tasks/$task_id/plans" '{"body":"approved"}' | id)
+  post "$base/plans/$plan_id/submit" '{}' >/dev/null
+  post "$base/plans/$plan_id/approve" '{"actor":"reviewer"}' >/dev/null
+done
+post "$base/tasks/$dependent_id/dependencies" "{\"dependsOnTaskId\":\"$prerequisite_id\"}" >/dev/null
+blocked_status=$(curl -sS -o ./ats-30-blocked.json -w '%{http_code}' -X POST "$base/tasks/$dependent_id/executions" -H 'content-type: application/json' -d '{"provider":"noop"}')
+test "$blocked_status" = 422
+node -e 'const r=JSON.parse(require("node:fs").readFileSync(process.argv[1])); if(r.error!=="DEPENDENCIES_UNMET") process.exit(1)' ./ats-30-blocked.json
+prereq_execution_id=$(post "$base/tasks/$prerequisite_id/executions" '{"provider":"noop"}' | id)
+post "$base/executions/$prereq_execution_id/finish" '{}' >/dev/null
+post "$base/tasks/$prerequisite_id/accept" '{"actor":"reviewer"}' >/dev/null
+allowed=$(post "$base/tasks/$dependent_id/executions" '{"provider":"noop"}')
+node -e 'if(!JSON.parse(process.argv[1]).id) process.exit(1)' "$allowed"
+
+first_id=$(post "$base/projects/$project_id/decision-memories" '{"content":"SQLite baseline","scope":"storage","source":{"type":"url","reference":"https://example.test/adr/sqlite"},"actor":"architect"}' | id)
+second_id=$(post "$base/projects/$project_id/decision-memories" "{\"content\":\"SQLite WAL\",\"scope\":\"storage\",\"source\":{\"type\":\"task\",\"reference\":\"$prerequisite_id\"},\"actor\":\"architect\"}" | id)
+post "$base/decision-memories/$first_id/supersede" "{\"replacementDecisionId\":\"$second_id\",\"actor\":\"reviewer\"}" >/dev/null
+curl -fsS "$base/projects/$project_id/decision-memories" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);if(r.length!==1||r[0].id!==process.argv[1])process.exit(1)})' "$second_id"
+curl -fsS "$base/projects/$project_id/decision-memories?status=all" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{if(JSON.parse(s).length!==2)process.exit(1)})'
+```
