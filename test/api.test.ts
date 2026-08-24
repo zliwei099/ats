@@ -253,7 +253,45 @@ test('loopback console lists tasks and reads their existing evidence package', a
   assert.match(script.body, /fetch\('\/tasks'\)/);
   assert.match(script.body, /\/evidence/);
   assert.match(script.body, /时效风险与升级信号/); assert.match(script.body, /\/risk/);
-  assert.doesNotMatch(script.body, /fetch\(['"]\/(?:projects|plans|executions)/);
+  assert.match(script.body, /\/projects\/' \+ encodeURIComponent\(evidence.task.project_id\) \+ '\/queue'/);
+  assert.doesNotMatch(script.body, /fetch\(['"]\/(?:plans|executions)/);
+  await app.close();
+});
+
+test('project queue is read-only, classifies readiness from existing gates, and refreshes stably', async () => {
+  const now = new Date('2026-08-24T12:00:00Z');
+  const store = new Store(':memory:', () => now); const app = buildServer(store);
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  const project = (await request('POST', '/projects', { name: 'queue' })).body;
+  const create = async (title: string, dueAt?: string) => (await request('POST', `/projects/${project.id}/tasks`, { title, actor: title + '-owner', dueAt })).body;
+  const ready = await create('ready'); const approval = await create('approval'); const prerequisite = await create('prerequisite'); const dependent = await create('dependent'); const active = await create('active'); const risk = await create('risk', '2026-08-24T11:00:00Z');
+  const approve = async (task: Record<string, any>) => { const plan = (await request('POST', `/tasks/${task.id}/plans`, { body: 'plan' })).body; await request('POST', `/plans/${plan.id}/submit`, {}); await request('POST', `/plans/${plan.id}/approve`, { actor: 'reviewer' }); };
+  for (const task of [ready, prerequisite, dependent, active, risk]) await approve(task);
+  await request('POST', `/tasks/${dependent.id}/dependencies`, { dependsOnTaskId: prerequisite.id });
+  await request('POST', `/tasks/${active.id}/executions`, { provider: 'noop' });
+  const queue = await request('GET', `/projects/${project.id}/queue`);
+  assert.equal(queue.response.statusCode, 200);
+  assert.deepEqual(queue.body.slice(0, 4).map((item: Record<string, string>) => [item.task_id, item.queue_status]), [
+    [risk.id, 'RISK_REQUIRES_ATTENTION'], [active.id, 'ACTIVE_EXECUTION'], [approval.id, 'WAITING_APPROVAL'], [dependent.id, 'DEPENDENCIES_UNMET']
+  ]);
+  assert.deepEqual((await request('GET', `/projects/${project.id}/queue`)).body, queue.body);
+  const blocked = queue.body.find((item: Record<string, string>) => item.task_id === dependent.id);
+  assert.equal(blocked.reason_code, 'PREREQUISITE_INCOMPLETE'); assert.equal(blocked.owner, 'dependent-owner'); assert.equal(blocked.trigger_facts.prerequisite_task_id, prerequisite.id); assert.equal(blocked.next_action.code, 'SATISFY_PREREQUISITE');
+  const activeExecution = (await request('GET', `/tasks/${active.id}/evidence`)).body.executions[0];
+  await request('POST', `/executions/${activeExecution.id}/finish`, {});
+  const refreshed = await request('GET', `/projects/${project.id}/queue`);
+  assert.equal(refreshed.body.find((item: Record<string, string>) => item.task_id === active.id).queue_status, 'WAITING_ACCEPTANCE');
+  const readyExecution = (await request('POST', `/tasks/${ready.id}/executions`, { provider: 'noop' })).body;
+  await request('POST', `/executions/${readyExecution.id}/finish`, {}); await request('POST', `/tasks/${ready.id}/accept`, { actor: 'reviewer' });
+  assert.ok(!(await request('GET', `/projects/${project.id}/queue`)).body.some((item: Record<string, string>) => item.task_id === ready.id));
+  const accepted = await request('POST', `/tasks/${risk.id}/accept`, {});
+  assert.equal(accepted.response.statusCode, 422); // execution/acceptance state machine remains unchanged by the queue.
+  assert.equal((await request('GET', '/projects/missing/queue')).response.statusCode, 404);
+  const script = await app.inject({ method: 'GET', url: '/console.js' });
+  assert.match(script.body, /项目执行队列/); assert.match(script.body, /\/projects\/' \+ encodeURIComponent\(evidence.task.project_id\) \+ '\/queue'/); assert.doesNotMatch(script.body, /queue.*POST/);
   await app.close();
 });
 
