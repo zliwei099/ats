@@ -34,6 +34,15 @@ export type EvidencePackage = {
 
 export type DecisionSource = { type: 'url' | 'task' | 'audit'; reference: string };
 
+type DependencyBlocker = {
+  code: string;
+  task_id: string;
+  depends_on_task_id?: string;
+  execution_id?: string;
+  status?: string;
+  message: string;
+};
+
 export class DomainError extends Error {
   constructor(message: string, readonly code = 'DOMAIN_ERROR') { super(message); }
 }
@@ -190,6 +199,42 @@ export class Store {
       CASE WHEN dependency.resolved_at IS NOT NULL THEN 1 ELSE 0 END AS satisfied
       FROM task_dependencies dependency JOIN tasks dependent ON dependent.id = dependency.task_id
       WHERE dependency.depends_on_task_id = ? ORDER BY dependency.created_at, dependency.id`).all(taskId) as RecordRow[];
+  }
+  dependencyStatus(taskId: string) {
+    const task = this.task(taskId);
+    const dependencies = this.dependencies(taskId);
+    const blockers: DependencyBlocker[] = [];
+    const prerequisiteBlocker = (dependency: RecordRow): DependencyBlocker | null => {
+      if (dependency.satisfied) return null;
+      const prerequisiteId = String(dependency.depends_on_task_id);
+      const prerequisite = this.task(prerequisiteId);
+      const plan = this.db.prepare('SELECT status FROM plans WHERE task_id=?').get(prerequisiteId) as { status?: string } | undefined;
+      const latestExecution = this.db.prepare('SELECT * FROM executions WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 1').get(prerequisiteId) as RecordRow | undefined;
+      const base = { task_id: taskId, depends_on_task_id: prerequisiteId, status: String(prerequisite.status) };
+      if (!plan || plan.status !== 'approved') return { ...base, code: 'PREREQUISITE_PLAN_NOT_APPROVED', message: '前置任务的计划尚未获批' };
+      if (latestExecution?.status === 'failed') return { ...base, code: 'PREREQUISITE_RETRY_REQUIRED', execution_id: String(latestExecution.id), message: '前置任务最近一次执行失败，需在既有重试流程中完成并验收' };
+      if (latestExecution?.status === 'active' && latestExecution.retry_of_execution_id) return { ...base, code: 'PREREQUISITE_RETRY_IN_PROGRESS', execution_id: String(latestExecution.id), message: '前置任务的重试正在执行，尚未验收' };
+      if (prerequisite.status === 'awaiting_acceptance') return { ...base, code: 'PREREQUISITE_AWAITING_ACCEPTANCE', message: '前置任务已完成，仍等待验收' };
+      if (prerequisite.status === 'rejected') return { ...base, code: 'PREREQUISITE_REJECTED', message: '前置任务已被拒绝，需回到既有流程后重新完成并验收' };
+      return { ...base, code: 'PREREQUISITE_INCOMPLETE', message: '前置任务尚未完成并验收' };
+    };
+    const directPrerequisites = dependencies.map(dependency => ({ ...dependency, blocker: prerequisiteBlocker(dependency) }));
+    for (const dependency of directPrerequisites) if (dependency.blocker) blockers.push(dependency.blocker);
+    const plan = this.db.prepare('SELECT status FROM plans WHERE task_id=?').get(taskId) as { status?: string } | undefined;
+    if (!plan || plan.status !== 'approved') blockers.push({ code: 'PLAN_NOT_APPROVED', task_id: taskId, status: plan?.status, message: '任务计划尚未获批' });
+    if (task.status !== 'ready') blockers.push({ code: 'TASK_NOT_READY', task_id: taskId, status: String(task.status), message: '任务必须处于 ready 状态才能开始执行' });
+    const active = this.db.prepare("SELECT id FROM executions WHERE task_id=? AND status='active'").get(taskId) as { id: string } | undefined;
+    if (active) blockers.push({ code: 'EXECUTION_ACTIVE', task_id: taskId, execution_id: active.id, message: '任务已有活跃执行' });
+    return {
+      task,
+      direct_prerequisites: directPrerequisites,
+      direct_dependents: this.blockedDependents(taskId),
+      blockers,
+      can_start: blockers.length === 0,
+      next_executable_condition: blockers.length === 0
+        ? '已满足已批准计划、全部前置任务验收和 ready 状态，可按既有执行入口开始'
+        : '完成 blockers 中列出的条件后，系统会按既有门禁重新判定是否可执行'
+    };
   }
   task(id: string) { const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as RecordRow | undefined; if (!row) throw new DomainError('task not found', 'NOT_FOUND'); return row; }
   handoffTask(taskId: string, fromOwner: string, toOwner: string, reason: string, actor = 'system') {

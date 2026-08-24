@@ -23,7 +23,7 @@ export const consoleHtml = `<!doctype html>
 </head>
 <body>
   <h1>任务证据包</h1>
-  <p class="subtle">本地只读视图：负责人交接、计划决定、执行失败与重试、状态迁移、验收和审计记录。</p>
+  <p class="subtle">本地只读视图：任务依赖、阻塞原因、负责人交接、计划决定、执行失败与重试、状态迁移、验收和审计记录。</p>
   <div class="toolbar"><select id="task-select" aria-label="任务"><option value="">选择任务</option></select><button id="reload" type="button">刷新</button></div>
   <p id="error" role="alert"></p><main id="content" aria-live="polite"><p class="empty">正在加载任务…</p></main>
   <script type="module" src="/console.js"></script>
@@ -39,13 +39,14 @@ const text = value => escapeHtml(value ?? '—');
 const rows = (items, columns) => items.length ? '<table><thead><tr>' + columns.map(column => '<th>' + text(column.label) + '</th>').join('') + '</tr></thead><tbody>' + items.map(item => '<tr>' + columns.map(column => '<td>' + (column.html ? column.html(item) : text(item[column.key])) + '</td>').join('') + '</tr>').join('') + '</tbody></table>' : '<p class="empty">无记录</p>';
 const details = values => '<dl>' + values.map(([label, value]) => '<dt>' + text(label) + '</dt><dd>' + text(value) + '</dd>').join('') + '</dl>';
 const section = (title, html) => '<section><h2>' + text(title) + '</h2>' + html + '</section>';
-function render(evidence) {
+function render(evidence, dependencyStatus) {
   const plan = evidence.plan ? details([['状态', evidence.plan.status], ['决策人', evidence.plan.decided_by], ['决定时间', evidence.plan.decided_at], ['内容', evidence.plan.body]]) : '<p class="empty">没有关联计划</p>';
   const acceptance = evidence.acceptance ? details([['验收人', evidence.acceptance.actor], ['验收时间', evidence.acceptance.created_at], ['审计事件', evidence.acceptance.event_id]]) : '<p class="empty">尚未验收</p>';
   content.innerHTML = section('任务', details([['标题', evidence.task.title], ['状态', evidence.task.status], ['当前负责人', evidence.task.owner], ['任务 ID', evidence.task.id], ['创建时间', evidence.task.created_at]]))
     + section('负责人责任链', rows(evidence.responsibility_chain, [{ label: '原负责人', key: 'from_owner' }, { label: '新负责人', key: 'to_owner' }, { label: '交接原因', key: 'reason' }, { label: '操作人', key: 'actor' }, { label: '时间', key: 'created_at' }, { label: '审计事件', key: 'event_id' }]))
     + section('前置依赖', rows(evidence.dependencies, [{ label: '关联任务', html: dependency => text(dependency.depends_on_title) + ' / ' + text(dependency.depends_on_task_id) }, { label: '任务状态', key: 'depends_on_status' }, { label: '阻塞是否解除', html: dependency => dependency.satisfied ? '是' : '否' }, { label: '建立时间', key: 'created_at' }, { label: '解除时间', key: 'resolved_at' }]))
     + section('阻塞的后续任务', rows(evidence.blocked_dependents, [{ label: '关联任务', html: dependency => text(dependency.task_title) + ' / ' + text(dependency.task_id) }, { label: '任务状态', key: 'task_status' }, { label: '依赖已解除', html: dependency => dependency.satisfied ? '是' : '否' }, { label: '建立时间', key: 'created_at' }, { label: '解除时间', key: 'resolved_at' }]))
+    + section('依赖门禁与下一步条件', details([['当前可执行', dependencyStatus.can_start ? '是' : '否'], ['下一步条件', dependencyStatus.next_executable_condition]]) + rows(dependencyStatus.blockers, [{ label: '原因代码', key: 'code' }, { label: '涉及前置任务', key: 'depends_on_task_id' }, { label: '任务状态', key: 'status' }, { label: '执行 ID', key: 'execution_id' }, { label: '说明', key: 'message' }]))
     + section('计划决定', plan)
     + section('执行', rows(evidence.executions, [{ label: '执行 ID', key: 'id' }, { label: '重试来源', key: 'retry_of_execution_id' }, { label: 'Provider', key: 'provider' }, { label: '状态', key: 'status' }, { label: '失败类别', key: 'failure_category' }, { label: '失败原因', key: 'failure_reason' }, { label: '启动责任人', key: 'started_by' }, { label: '完成责任人', key: 'finished_by' }, { label: '创建时间', key: 'created_at' }, { label: '完成时间', key: 'finished_at' }]))
     + section('状态迁移', rows(evidence.status_transitions, [{ label: '从', key: 'from' }, { label: '到', key: 'to' }, { label: '责任人', key: 'actor' }, { label: '时间', key: 'created_at' }]))
@@ -56,7 +57,7 @@ function render(evidence) {
 async function loadEvidence() {
   error.textContent = '';
   if (!select.value) { content.innerHTML = '<p class="empty">选择一个任务以查看证据包。</p>'; return; }
-  try { const response = await fetch('/tasks/' + encodeURIComponent(select.value) + '/evidence'); if (!response.ok) throw new Error('请求失败（HTTP ' + response.status + '）'); render(await response.json()); } catch (reason) { error.textContent = reason instanceof Error ? reason.message : '无法加载证据包'; }
+  try { const id = encodeURIComponent(select.value); const [evidenceResponse, statusResponse] = await Promise.all([fetch('/tasks/' + id + '/evidence'), fetch('/tasks/' + id + '/dependency-status')]); if (!evidenceResponse.ok || !statusResponse.ok) throw new Error('请求失败（HTTP ' + (!evidenceResponse.ok ? evidenceResponse.status : statusResponse.status) + '）'); render(await evidenceResponse.json(), await statusResponse.json()); } catch (reason) { error.textContent = reason instanceof Error ? reason.message : '无法加载证据包'; }
 }
 async function loadTasks() {
   try {

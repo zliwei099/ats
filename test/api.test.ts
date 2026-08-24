@@ -175,6 +175,53 @@ test('dependency API rejects self references and cycles', async () => {
   await app.close();
 });
 
+test('dependency status explains stable direct relationships and failed prerequisite retry chains', async () => {
+  const app = buildServer(new Store());
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  const approve = async (taskId: string) => {
+    const plan = (await request('POST', `/tasks/${taskId}/plans`, { body: 'approved' })).body;
+    await request('POST', `/plans/${plan.id}/submit`, {}); await request('POST', `/plans/${plan.id}/approve`, { actor: 'reviewer' });
+  };
+  const finishAndAccept = async (taskId: string) => {
+    const execution = (await request('POST', `/tasks/${taskId}/executions`, { provider: 'noop' })).body;
+    await request('POST', `/executions/${execution.id}/finish`, {}); await request('POST', `/tasks/${taskId}/accept`, { actor: 'reviewer' });
+  };
+  const project = (await request('POST', '/projects', { name: 'dependency status' })).body;
+  const unapproved = (await request('POST', `/projects/${project.id}/tasks`, { title: 'unapproved prerequisite' })).body;
+  const failedPrerequisite = (await request('POST', `/projects/${project.id}/tasks`, { title: 'failed prerequisite' })).body;
+  const dependent = (await request('POST', `/projects/${project.id}/tasks`, { title: 'dependent' })).body;
+  await approve(failedPrerequisite.id); await approve(dependent.id);
+  await request('POST', `/tasks/${dependent.id}/dependencies`, { dependsOnTaskId: unapproved.id });
+  await request('POST', `/tasks/${dependent.id}/dependencies`, { dependsOnTaskId: failedPrerequisite.id });
+  const failedExecution = (await request('POST', `/tasks/${failedPrerequisite.id}/executions`, { provider: 'noop' })).body;
+  await request('POST', `/executions/${failedExecution.id}/fail`, { category: 'timeout', reason: 'provider timeout' });
+
+  const first = await request('GET', `/tasks/${dependent.id}/dependency-status`);
+  const repeated = await request('GET', `/tasks/${dependent.id}/dependency-status`);
+  const dependencies = await request('GET', `/tasks/${dependent.id}/dependencies`);
+  assert.equal(first.response.statusCode, 200); assert.deepEqual(repeated.body, first.body);
+  assert.deepEqual(first.body.direct_prerequisites.map((item: Record<string, string>) => item.id), dependencies.body.map((item: Record<string, string>) => item.id));
+  assert.deepEqual(first.body.direct_prerequisites.map((item: Record<string, any>) => item.blocker.code), ['PREREQUISITE_PLAN_NOT_APPROVED', 'PREREQUISITE_RETRY_REQUIRED']);
+  assert.equal(first.body.can_start, false);
+  assert.ok(first.body.blockers.some((blocker: Record<string, string>) => blocker.code === 'PREREQUISITE_PLAN_NOT_APPROVED'));
+  assert.ok(first.body.blockers.some((blocker: Record<string, string>) => blocker.code === 'PREREQUISITE_RETRY_REQUIRED' && blocker.execution_id === failedExecution.id));
+  const reverse = await request('GET', `/tasks/${unapproved.id}/dependency-status`);
+  assert.deepEqual(reverse.body.direct_dependents.map((item: Record<string, string>) => item.task_id), [dependent.id]);
+  assert.equal((await request('GET', '/tasks/missing/dependency-status')).response.statusCode, 404);
+
+  await approve(unapproved.id); await finishAndAccept(unapproved.id);
+  const retry = (await request('POST', `/executions/${failedExecution.id}/retry`, { actor: 'operator' })).body;
+  await request('POST', `/executions/${retry.id}/finish`, {}); await request('POST', `/tasks/${failedPrerequisite.id}/accept`, { actor: 'reviewer' });
+  const unblocked = await request('GET', `/tasks/${dependent.id}/dependency-status`);
+  assert.equal(unblocked.body.can_start, true);
+  assert.deepEqual(unblocked.body.blockers, []);
+  assert.ok(unblocked.body.direct_prerequisites.every((item: Record<string, any>) => item.satisfied === 1 && item.blocker === null));
+  await app.close();
+});
+
 test('loopback console lists tasks and reads their existing evidence package', async () => {
   const app = buildServer(new Store());
   const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
@@ -201,6 +248,7 @@ test('loopback console lists tasks and reads their existing evidence package', a
   assert.equal(script.statusCode, 200);
   assert.match(script.body, /fetch\('\/tasks'\)/);
   assert.match(script.body, /\/evidence/);
+  assert.match(script.body, /dependency-status/);
   assert.doesNotMatch(script.body, /fetch\(['"]\/(?:projects|plans|executions)/);
   await app.close();
 });

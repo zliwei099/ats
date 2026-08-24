@@ -69,6 +69,18 @@ curl -sS http://127.0.0.1:3000/tasks/$dependent_id/evidence
 
 `GET /tasks/:taskId/dependencies` 以 `created_at, id` 稳定排序列出前置关系；`GET /tasks/:taskId/evidence` 同时包含 `dependencies`、`blocked_dependents` 和关联的创建/解除审计事件。控制台在任务证据包中只读展示前置依赖和被其阻塞的后续任务。
 
+### 依赖阻塞说明
+
+`GET /tasks/:taskId/dependency-status` 是面向控制台和自动化协作方的只读门禁解释。它返回按 `created_at, id` 稳定排序的 `direct_prerequisites` 与 `direct_dependents`，以及机器可读的 `blockers`、`can_start` 和 `next_executable_condition`。前置关系中的 `blocker` 会准确说明当前尚未解除的原因，例如 `PREREQUISITE_PLAN_NOT_APPROVED`（前置未获批）、`PREREQUISITE_INCOMPLETE` / `PREREQUISITE_AWAITING_ACCEPTANCE`（前置未完成或待验收）、`PREREQUISITE_RETRY_REQUIRED` / `PREREQUISITE_RETRY_IN_PROGRESS`（失败后的既有重试链尚未完成）。当前任务自身仍未满足原有门禁时，`blockers` 会给出 `PLAN_NOT_APPROVED`、`TASK_NOT_READY` 或 `EXECUTION_ACTIVE`。
+
+不存在的任务返回 `404 NOT_FOUND`；此查询不写入数据库，也不提供执行、审批、重试或交接的绕过入口：
+
+```sh
+curl -sS http://127.0.0.1:3000/tasks/$dependent_id/dependency-status
+```
+
+待所有 `blockers` 消失且 `can_start: true` 后，仍须调用既有 `POST /tasks/:taskId/executions`；服务会重新执行原有审批、依赖、状态机和单活跃执行检查。
+
 ## 任务证据包查询
 
 `GET /tasks/:taskId/evidence` 是给 loopback 控制台与独立复核使用的稳定证据视图。它只读取已有持久化记录，不会改写审计事件；响应包含 `task`、已关联的 `plan`、按 `created_at, id` 排序的 `executions`，以及按不可变写入 `sequence` 排序的 `audit_events`。`status_transitions`、`responsibility_chain` 和最终 `acceptance` 均由这些审计事件派生。计划的 `decided_by` 是审批人，执行条目的 `started_by` / `finished_by` 是执行者，`acceptance.actor` 是验收人（尚未验收时为 `null`）。
@@ -90,9 +102,9 @@ curl -sS http://127.0.0.1:3000/tasks/$task_id/evidence
 
 ## 本地浏览器控制台
 
-启动服务并按上面的 API 闭环创建一个已验收任务后，在浏览器打开 `http://127.0.0.1:3000/console`。下拉框列出所有任务；选择任务即可读取既有 `GET /tasks/:taskId/evidence` 证据包，按稳定顺序展示当前负责人、责任链、计划决策人、执行责任人、状态迁移、验收人和审计记录。也可以使用 `http://127.0.0.1:3000/console?taskId=<任务ID>` 直接打开某个任务。
+启动服务并按上面的 API 闭环创建一个已验收任务后，在浏览器打开 `http://127.0.0.1:3000/console`。下拉框列出所有任务；选择任务即可读取既有 `GET /tasks/:taskId/evidence` 与 `GET /tasks/:taskId/dependency-status`，按稳定顺序展示直接前置/反向依赖、阻塞原因、下一步条件、当前负责人、责任链、计划决策人、执行责任人、状态迁移、验收人和审计记录。也可以使用 `http://127.0.0.1:3000/console?taskId=<任务ID>` 直接打开某个任务。
 
-该控制台仅调用 `GET /tasks?status=accepted` 和 `GET /tasks/:taskId/evidence`，不提供任何写入操作，服务仍只监听 `127.0.0.1`。
+该控制台仅调用只读的 `GET /tasks`、`GET /tasks/:taskId/evidence` 和 `GET /tasks/:taskId/dependency-status`，不提供任何写入操作，服务仍只监听 `127.0.0.1`。
 
 ## 项目决策记忆与来源追溯
 
