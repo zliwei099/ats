@@ -48,6 +48,29 @@ test('approval, execution, and acceptance state flow is audited', () => {
   const execution = store.startExecution(taskId, 'noop'); store.finishExecution(String(execution.id)); store.transitionTask(taskId, 'accepted', 'reviewer');
   assert.equal(store.task(taskId).status, 'accepted'); assert.ok(store.auditEvents(taskId).length >= 4);
 });
+test('handoff appends an immutable responsibility chain and assigns future executions to the new owner', () => {
+  const store = new Store(); const project = store.createProject('P'); const task = store.createTask(String(project.id), 'T', 'alice'); const taskId = String(task.id);
+  approve(store, taskId);
+  const handedOff = store.handoffTask(taskId, 'alice', 'bob', 'handoff after review', 'coordinator');
+  assert.equal(handedOff.owner, 'bob');
+  const execution = store.startExecution(taskId, 'noop', 'someone-else');
+  const evidence = store.evidencePackage(taskId);
+  assert.equal(evidence.executions[0].started_by, 'bob');
+  assert.deepEqual(evidence.responsibility_chain.map(item => [item.from_owner, item.to_owner, item.reason]), [[null, 'alice', null], ['alice', 'bob', 'handoff after review']]);
+  assert.ok(evidence.audit_events.some((event: any) => event.action === 'ownership_handed_off' && event.detail.toOwner === 'bob'));
+  assert.equal(store.execution(String(execution.id)).status, 'active');
+});
+test('handoff rejects invalid owners, missing tasks, and active executions without changing history', () => {
+  const store = new Store(); const project = store.createProject('P'); const task = store.createTask(String(project.id), 'T', 'alice'); const taskId = String(task.id);
+  mustThrow(() => store.handoffTask(taskId, 'alice', 'alice', 'same'), 'INVALID_HANDOFF');
+  mustThrow(() => store.handoffTask(taskId, '', 'bob', 'missing source'), 'INVALID_HANDOFF');
+  mustThrow(() => store.handoffTask('missing', 'alice', 'bob', 'missing task'), 'NOT_FOUND');
+  approve(store, taskId); store.startExecution(taskId, 'noop');
+  const before = store.evidencePackage(taskId);
+  mustThrow(() => store.handoffTask(taskId, 'alice', 'bob', 'active execution'), 'EXECUTION_ACTIVE');
+  const after = store.evidencePackage(taskId);
+  assert.equal(after.task.owner, 'alice'); assert.deepEqual(after.responsibility_chain, before.responsibility_chain); assert.deepEqual(after.audit_events, before.audit_events);
+});
 test('failed executions retain their reason and retry only creates a linked new attempt', () => {
   const { store, taskId } = setup(); approve(store, taskId);
   const first = store.startExecution(taskId, 'noop', 'executor');

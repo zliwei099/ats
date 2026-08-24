@@ -71,13 +71,26 @@ curl -sS http://127.0.0.1:3000/tasks/$dependent_id/evidence
 
 ## 任务证据包查询
 
-`GET /tasks/:taskId/evidence` 是给 loopback 控制台与独立复核使用的稳定证据视图。它只读取已有持久化记录，不会改写审计事件；响应包含 `task`、已关联的 `plan`、按 `created_at, id` 排序的 `executions`，以及按不可变写入 `sequence` 排序的 `audit_events`。`status_transitions` 和最终 `acceptance` 均由这些审计事件派生。计划的 `decided_by` 是审批人，执行条目的 `started_by` / `finished_by` 是执行者，`acceptance.actor` 是验收人（尚未验收时为 `null`）。
+`GET /tasks/:taskId/evidence` 是给 loopback 控制台与独立复核使用的稳定证据视图。它只读取已有持久化记录，不会改写审计事件；响应包含 `task`、已关联的 `plan`、按 `created_at, id` 排序的 `executions`，以及按不可变写入 `sequence` 排序的 `audit_events`。`status_transitions`、`responsibility_chain` 和最终 `acceptance` 均由这些审计事件派生。计划的 `decided_by` 是审批人，执行条目的 `started_by` / `finished_by` 是执行者，`acceptance.actor` 是验收人（尚未验收时为 `null`）。
+
+## 负责人交接与责任链
+
+任务创建者是初始负责人（创建任务时用 `actor` 指定；省略时为 `system`）。仅可通过 `POST /tasks/:taskId/handoffs` 交接，传入来源负责人、目标负责人和原因；交接追加 `ownership_handed_off` 审计事件，绝不会改写既有执行、审批、验收或失败—重试记录。来源和目标不得为空或相同，来源必须等于当前负责人；任务不存在返回 `404 NOT_FOUND`。若有活跃执行，接口返回 `409 EXECUTION_ACTIVE`，不改变当前负责人或审计历史。
+
+```sh
+curl -sS -X POST http://127.0.0.1:3000/tasks/$task_id/handoffs \
+  -H 'content-type: application/json' \
+  -d '{"fromOwner":"planner","toOwner":"executor-b","reason":"review completed","actor":"coordinator"}'
+curl -sS http://127.0.0.1:3000/tasks/$task_id/evidence
+```
+
+成功后 `task.owner` 为 `executor-b`，稳定排序的 `responsibility_chain` 会保留初始负责人与每次交接的来源、目标、原因、操作人和时间。后续 `POST /tasks/:taskId/executions` 的执行启动归属当前负责人；之前执行保留原本的 `started_by`。控制台只读显示当前负责人和完整责任链，不提供交接按钮。
 
 验证：`npm test`、`npm run typecheck`。
 
 ## 本地浏览器控制台
 
-启动服务并按上面的 API 闭环创建一个已验收任务后，在浏览器打开 `http://127.0.0.1:3000/console`。下拉框只列出已验收任务；选择任务即可读取既有 `GET /tasks/:taskId/evidence` 证据包，按稳定顺序展示计划决策人、执行责任人、状态迁移、验收人和审计记录。也可以使用 `http://127.0.0.1:3000/console?taskId=<任务ID>` 直接打开某个已验收任务。
+启动服务并按上面的 API 闭环创建一个已验收任务后，在浏览器打开 `http://127.0.0.1:3000/console`。下拉框列出所有任务；选择任务即可读取既有 `GET /tasks/:taskId/evidence` 证据包，按稳定顺序展示当前负责人、责任链、计划决策人、执行责任人、状态迁移、验收人和审计记录。也可以使用 `http://127.0.0.1:3000/console?taskId=<任务ID>` 直接打开某个任务。
 
 该控制台仅调用 `GET /tasks?status=accepted` 和 `GET /tasks/:taskId/evidence`，不提供任何写入操作，服务仍只监听 `127.0.0.1`。
 

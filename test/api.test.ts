@@ -86,11 +86,39 @@ test('task evidence package joins approval, execution, transitions, and acceptan
   assert.equal(evidence.plan.id, plan.id);
   assert.equal(evidence.plan.decided_by, 'approver');
   assert.equal(evidence.executions[0].id, execution.id);
-  assert.equal(evidence.executions[0].started_by, 'executor');
+  assert.equal(evidence.executions[0].started_by, 'planner');
   assert.equal(evidence.executions[0].finished_by, 'executor');
   assert.deepEqual(evidence.status_transitions.map((transition: Record<string, string>) => transition.to), ['ready', 'executing', 'awaiting_acceptance', 'accepted']);
   assert.equal(evidence.acceptance.actor, 'acceptor');
   assert.ok(evidence.audit_events.every((event: Record<string, string>) => [task.id, plan.id, execution.id].includes(event.entity_id)));
+  await app.close();
+});
+
+test('handoff HTTP API preserves responsibility history and rejects invalid or active handoffs', async () => {
+  const app = buildServer(new Store());
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  const project = (await request('POST', '/projects', { name: 'handoff' })).body;
+  const task = (await request('POST', `/projects/${project.id}/tasks`, { title: 'ship', actor: 'alice' })).body;
+  const invalid = await request('POST', `/tasks/${task.id}/handoffs`, { fromOwner: 'alice', toOwner: 'alice', reason: 'same' });
+  assert.equal(invalid.response.statusCode, 422); assert.equal(invalid.body.error, 'INVALID_HANDOFF');
+  const missing = await request('POST', '/tasks/missing/handoffs', { fromOwner: 'alice', toOwner: 'bob', reason: 'missing' });
+  assert.equal(missing.response.statusCode, 404); assert.equal(missing.body.error, 'NOT_FOUND');
+  const handoff = await request('POST', `/tasks/${task.id}/handoffs`, { fromOwner: 'alice', toOwner: 'bob', reason: 'review complete', actor: 'coordinator' });
+  assert.equal(handoff.response.statusCode, 200); assert.equal(handoff.body.owner, 'bob');
+  const plan = (await request('POST', `/tasks/${task.id}/plans`, { body: 'approved' })).body;
+  await request('POST', `/plans/${plan.id}/submit`, {}); await request('POST', `/plans/${plan.id}/approve`, { actor: 'reviewer' });
+  const execution = await request('POST', `/tasks/${task.id}/executions`, { provider: 'noop', actor: 'alice' });
+  assert.equal(execution.response.statusCode, 201);
+  const active = await request('POST', `/tasks/${task.id}/handoffs`, { fromOwner: 'bob', toOwner: 'carol', reason: 'must reject' });
+  assert.equal(active.response.statusCode, 409); assert.equal(active.body.error, 'EXECUTION_ACTIVE');
+  const evidence = await request('GET', `/tasks/${task.id}/evidence`);
+  assert.deepEqual(evidence.body.responsibility_chain.map((item: Record<string, string | null>) => [item.from_owner, item.to_owner, item.reason]), [[null, 'alice', null], ['alice', 'bob', 'review complete']]);
+  assert.equal(evidence.body.executions[0].started_by, 'bob');
+  const script = await app.inject({ method: 'GET', url: '/console.js' });
+  assert.match(script.body, /负责人责任链/); assert.doesNotMatch(script.body, /handoffs.*POST/);
   await app.close();
 });
 
