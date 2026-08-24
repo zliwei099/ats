@@ -33,6 +33,27 @@ curl -sS http://127.0.0.1:3000/tasks/$task_id
 
 最后一个响应的 `status` 应为 `accepted`。SQLite schema 会在服务首次启动时自动创建；如果 `ATS_DB` 指向不存在的父目录，服务也会自动创建该目录。
 
+## 计划版本与审批决定历史
+
+每次 `POST /tasks/:taskId/plans` 都会追加一个不可变版本（从 `1` 起按任务递增），而非覆盖旧计划。`GET /tasks/:taskId/plans` 和 `GET /tasks/:taskId/evidence` 的 `plan_history` 都按版本稳定升序返回计划正文、创建者/时间、审批决定者/时间及拒绝原因；`is_current: true` 标识唯一的当前版本，较早版本以 `display_status: "superseded"` 呈现。`evidence.plan` 是当前版本。
+
+执行门禁只认可当前版本：当前版本必须为 `approved`，即使更早版本曾获批也不能绕过新草案、已提交或已拒绝版本。拒绝接口可选传入原因：
+
+```sh
+first=$(curl -sS -X POST http://127.0.0.1:3000/tasks/$task_id/plans -H 'content-type: application/json' -d '{"body":"first plan","actor":"planner-a"}')
+first_id=$(node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id))' <<< "$first")
+curl -sS -X POST http://127.0.0.1:3000/plans/$first_id/submit -H 'content-type: application/json' -d '{"actor":"planner-a"}'
+curl -sS -X POST http://127.0.0.1:3000/plans/$first_id/reject -H 'content-type: application/json' -d '{"actor":"reviewer-a","reason":"needs rollback details"}'
+second=$(curl -sS -X POST http://127.0.0.1:3000/tasks/$task_id/plans -H 'content-type: application/json' -d '{"body":"revised plan","actor":"planner-b"}')
+second_id=$(node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id))' <<< "$second")
+curl -sS -X POST http://127.0.0.1:3000/plans/$second_id/submit -H 'content-type: application/json' -d '{"actor":"planner-b"}'
+curl -sS -X POST http://127.0.0.1:3000/plans/$second_id/approve -H 'content-type: application/json' -d '{"actor":"reviewer-b"}'
+curl -sS http://127.0.0.1:3000/tasks/$task_id/plans
+curl -sS http://127.0.0.1:3000/tasks/$task_id/evidence
+```
+
+本地数据库若来自旧版单计划 schema，会在首次打开时保留原记录为版本 `1` 后再启用多版本历史。浏览器控制台在任务证据中只读显示当前计划和完整计划版本/决定历史；没有计划、审批或执行写入按钮。
+
 ## 失败处置与受控重试
 
 活跃执行可显式写入稳定失败类别 `provider_error`、`timeout`、`validation_error`、`cancelled` 或 `unknown`，并提供简明原因。失败会结束该执行、将任务返回 `ready`，保留原执行与审计事件；不会覆盖历史记录。只有失败执行可重试：`POST /executions/:executionId/retry` 创建一个新的执行记录，并将其 `retry_of_execution_id` 关联到原执行。
