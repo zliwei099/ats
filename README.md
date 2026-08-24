@@ -69,6 +69,16 @@ curl -sS http://127.0.0.1:3000/tasks/$dependent_id/evidence
 
 `GET /tasks/:taskId/dependencies` 以 `created_at, id` 稳定排序列出前置关系；`GET /tasks/:taskId/evidence` 同时包含 `dependencies`、`blocked_dependents` 和关联的创建/解除审计事件。控制台在任务证据包中只读展示前置依赖和被其阻塞的后续任务。
 
+### 依赖状态与阻塞解释
+
+`GET /tasks/:taskId/dependency-status` 是依赖门禁的只读解释视图。它以稳定顺序返回直接 `prerequisites` 与反向 `dependents`，以及 `blocking_reasons`、`next_executable_conditions` 和布尔值 `can_start`；不会创建执行、修改依赖或写入审计记录。不存在的任务返回 `404 NOT_FOUND`。
+
+当任务暂不能执行时，`blocking_reasons` 会列出实际未满足条件，例如 `PLAN_NOT_APPROVED`、`PREREQUISITE_INCOMPLETE`、`PREREQUISITE_REJECTED`、`PREREQUISITE_FAILED_RETRY_REQUIRED`、`PREREQUISITE_RETRY_IN_PROGRESS`、`TASK_NOT_READY` 或 `ACTIVE_EXECUTION`。每个前置条件都保留关联的任务/依赖 ID；当前置任务完成原有审批、执行和验收闭环后，`PREREQUISITE_ACCEPTED` 变为已满足，且 `can_start` 会在其余既有门禁同样满足时变为 `true`。
+
+```sh
+curl -sS http://127.0.0.1:3000/tasks/$dependent_id/dependency-status
+```
+
 ## 任务证据包查询
 
 `GET /tasks/:taskId/evidence` 是给 loopback 控制台与独立复核使用的稳定证据视图。它只读取已有持久化记录，不会改写审计事件；响应包含 `task`、已关联的 `plan`、按 `created_at, id` 排序的 `executions`，以及按不可变写入 `sequence` 排序的 `audit_events`。`status_transitions`、`responsibility_chain` 和最终 `acceptance` 均由这些审计事件派生。计划的 `decided_by` 是审批人，执行条目的 `started_by` / `finished_by` 是执行者，`acceptance.actor` 是验收人（尚未验收时为 `null`）。
@@ -90,9 +100,9 @@ curl -sS http://127.0.0.1:3000/tasks/$task_id/evidence
 
 ## 本地浏览器控制台
 
-启动服务并按上面的 API 闭环创建一个已验收任务后，在浏览器打开 `http://127.0.0.1:3000/console`。下拉框列出所有任务；选择任务即可读取既有 `GET /tasks/:taskId/evidence` 证据包，按稳定顺序展示当前负责人、责任链、计划决策人、执行责任人、状态迁移、验收人和审计记录。也可以使用 `http://127.0.0.1:3000/console?taskId=<任务ID>` 直接打开某个任务。
+启动服务并按上面的 API 闭环创建任务后，在浏览器打开 `http://127.0.0.1:3000/console`。下拉框列出所有任务；选择任务即可读取既有 `GET /tasks/:taskId/evidence` 和 `GET /tasks/:taskId/dependency-status`，按稳定顺序展示直接/反向依赖、机器可读阻塞原因、下一步执行条件、当前负责人、责任链、计划决策人、执行责任人、状态迁移、验收人和审计记录。也可以使用 `http://127.0.0.1:3000/console?taskId=<任务ID>` 直接打开某个任务。
 
-该控制台仅调用 `GET /tasks?status=accepted` 和 `GET /tasks/:taskId/evidence`，不提供任何写入操作，服务仍只监听 `127.0.0.1`。
+该控制台仅调用 `GET /tasks`、`GET /tasks/:taskId/evidence` 和 `GET /tasks/:taskId/dependency-status`，不提供任何写入操作，服务仍只监听 `127.0.0.1`。
 
 ## 项目决策记忆与来源追溯
 

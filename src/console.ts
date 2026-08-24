@@ -23,7 +23,7 @@ export const consoleHtml = `<!doctype html>
 </head>
 <body>
   <h1>任务证据包</h1>
-  <p class="subtle">本地只读视图：负责人交接、计划决定、执行失败与重试、状态迁移、验收和审计记录。</p>
+  <p class="subtle">本地只读视图：依赖关系、阻塞原因、可执行条件、负责人交接、计划决定、执行失败与重试、状态迁移、验收和审计记录。</p>
   <div class="toolbar"><select id="task-select" aria-label="任务"><option value="">选择任务</option></select><button id="reload" type="button">刷新</button></div>
   <p id="error" role="alert"></p><main id="content" aria-live="polite"><p class="empty">正在加载任务…</p></main>
   <script type="module" src="/console.js"></script>
@@ -53,10 +53,21 @@ function render(evidence) {
     + section('项目决策记忆（只读）', rows(evidence.decision_memories, [{ label: '内容', key: 'content' }, { label: '来源', html: decision => text(decision.source_type) + ': ' + text(decision.source_reference) }, { label: '适用范围', key: 'scope' }, { label: '状态', key: 'status' }, { label: '替代决策', html: decision => text(decision.superseded_by_content) + ' / ' + text(decision.superseded_by) }, { label: '创建者', key: 'created_by' }, { label: '创建时间', key: 'created_at' }]))
     + section('审计记录', rows(evidence.audit_events, [{ label: '序号', key: 'sequence' }, { label: '实体', html: event => text(event.entity_type) + ' / ' + text(event.entity_id) }, { label: '动作', key: 'action' }, { label: '责任人', key: 'actor' }, { label: '详情', html: event => '<code>' + text(JSON.stringify(event.detail)) + '</code>' }, { label: '时间', key: 'created_at' }]));
 }
+function renderDependencyStatus(view) {
+  const summary = view.can_start ? '<p>依赖与现有执行门禁均已满足：任务可按既有执行入口启动。</p>' : '<p class="empty">任务尚不能启动；请完成下列未满足条件。</p>';
+  return section('依赖状态与下一步条件', summary + details([['当前可执行', view.can_start ? '是' : '否']])
+    + '<h3>阻塞原因</h3>' + rows(view.blocking_reasons, [{ label: '代码', key: 'code' }, { label: '关联任务', key: 'task_id' }, { label: '任务状态', key: 'status' }, { label: '执行记录', key: 'execution_id' }])
+    + '<h3>执行条件</h3>' + rows(view.next_executable_conditions, [{ label: '条件', key: 'code' }, { label: '已满足', html: condition => condition.satisfied ? '是' : '否' }, { label: '关联任务', key: 'task_id' }]));
+}
 async function loadEvidence() {
   error.textContent = '';
   if (!select.value) { content.innerHTML = '<p class="empty">选择一个任务以查看证据包。</p>'; return; }
-  try { const response = await fetch('/tasks/' + encodeURIComponent(select.value) + '/evidence'); if (!response.ok) throw new Error('请求失败（HTTP ' + response.status + '）'); render(await response.json()); } catch (reason) { error.textContent = reason instanceof Error ? reason.message : '无法加载证据包'; }
+  try {
+    const taskId = encodeURIComponent(select.value);
+    const [evidenceResponse, dependencyResponse] = await Promise.all([fetch('/tasks/' + taskId + '/evidence'), fetch('/tasks/' + taskId + '/dependency-status')]);
+    if (!evidenceResponse.ok || !dependencyResponse.ok) throw new Error('请求失败（HTTP ' + (!evidenceResponse.ok ? evidenceResponse.status : dependencyResponse.status) + '）');
+    render(await evidenceResponse.json()); content.insertAdjacentHTML('afterbegin', renderDependencyStatus(await dependencyResponse.json()));
+  } catch (reason) { error.textContent = reason instanceof Error ? reason.message : '无法加载证据包'; }
 }
 async function loadTasks() {
   try {

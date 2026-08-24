@@ -175,6 +175,31 @@ test('dependency API rejects self references and cycles', async () => {
   await app.close();
 });
 
+test('dependency-status API is read-only, stable, and explains a multi-prerequisite release', async () => {
+  const app = buildServer(new Store());
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  const project = (await request('POST', '/projects', { name: 'dependency status' })).body;
+  const createApproved = async (title: string) => { const task = (await request('POST', `/projects/${project.id}/tasks`, { title })).body; const plan = (await request('POST', `/tasks/${task.id}/plans`, { body: 'approved' })).body; await request('POST', `/plans/${plan.id}/submit`, {}); await request('POST', `/plans/${plan.id}/approve`, { actor: 'reviewer' }); return task; };
+  const [first, second, dependent] = await Promise.all(['first', 'second', 'dependent'].map(createApproved));
+  await request('POST', `/tasks/${dependent.id}/dependencies`, { dependsOnTaskId: first.id });
+  await request('POST', `/tasks/${dependent.id}/dependencies`, { dependsOnTaskId: second.id });
+  const view = await request('GET', `/tasks/${dependent.id}/dependency-status`); const repeated = await request('GET', `/tasks/${dependent.id}/dependency-status`);
+  assert.equal(view.response.statusCode, 200); assert.deepEqual(repeated.body, view.body); assert.equal(view.body.can_start, false);
+  assert.deepEqual(view.body.prerequisites.map((item: Record<string, string>) => item.depends_on_task_id), (await request('GET', `/tasks/${dependent.id}/dependencies`)).body.map((item: Record<string, string>) => item.depends_on_task_id));
+  assert.equal(view.body.blocking_reasons.filter((reason: Record<string, string>) => reason.code === 'PREREQUISITE_INCOMPLETE').length, 2);
+  for (const task of [first, second]) { const execution = (await request('POST', `/tasks/${task.id}/executions`, { provider: 'noop' })).body; await request('POST', `/executions/${execution.id}/finish`, {}); await request('POST', `/tasks/${task.id}/accept`, { actor: 'reviewer' }); }
+  const released = await request('GET', `/tasks/${dependent.id}/dependency-status`);
+  assert.equal(released.body.can_start, true); assert.deepEqual(released.body.blocking_reasons, []);
+  const missing = await request('GET', '/tasks/missing/dependency-status');
+  assert.equal(missing.response.statusCode, 404); assert.equal(missing.body.error, 'NOT_FOUND');
+  const script = await app.inject({ method: 'GET', url: '/console.js' });
+  assert.match(script.body, /依赖状态与下一步条件/); assert.match(script.body, /dependency-status/); assert.doesNotMatch(script.body, /dependency-status.*POST/);
+  await app.close();
+});
+
 test('loopback console lists tasks and reads their existing evidence package', async () => {
   const app = buildServer(new Store());
   const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
