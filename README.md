@@ -100,9 +100,30 @@ curl -sS http://127.0.0.1:3000/tasks/$task_id/evidence
 
 ## 本地浏览器控制台
 
-启动服务并按上面的 API 闭环创建任务后，在浏览器打开 `http://127.0.0.1:3000/console`。下拉框列出所有任务；选择任务即可读取既有 `GET /tasks/:taskId/evidence` 和 `GET /tasks/:taskId/dependency-status`，按稳定顺序展示直接/反向依赖、机器可读阻塞原因、下一步执行条件、当前负责人、责任链、计划决策人、执行责任人、状态迁移、验收人和审计记录。也可以使用 `http://127.0.0.1:3000/console?taskId=<任务ID>` 直接打开某个任务。
+启动服务并按上面的 API 闭环创建任务后，在浏览器打开 `http://127.0.0.1:3000/console`。下拉框列出所有任务；选择任务即可读取既有 `GET /tasks/:taskId/evidence`、`GET /tasks/:taskId/dependency-status` 和 `GET /tasks/:taskId/risk`，按稳定顺序展示时效风险、处置条件、直接/反向依赖、机器可读阻塞原因、下一步执行条件、当前负责人、责任链、计划决策人、执行责任人、状态迁移、验收人和审计记录。也可以使用 `http://127.0.0.1:3000/console?taskId=<任务ID>` 直接打开某个任务。
 
 该控制台仅调用 `GET /tasks`、`GET /tasks/:taskId/evidence` 和 `GET /tasks/:taskId/dependency-status`，不提供任何写入操作，服务仍只监听 `127.0.0.1`。
+
+## 任务时效风险与升级信号
+
+创建任务时可选传入 ISO 8601 的 `dueAt`；该字段会规范化为任务上的可审计 `due_at`，并同时记录在 `created` 审计事件中。无效时间会返回 `422 INVALID_DUE_DATE`。风险视图完全只读，不会创建执行、改变负责人、修改审批或状态机。
+
+```sh
+task=$(curl -sS -X POST http://127.0.0.1:3000/projects/$project_id/tasks \
+  -H 'content-type: application/json' \
+  -d '{"title":"review release","actor":"release-owner","dueAt":"2026-08-25T12:00:00Z"}')
+task_id=$(node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id))' <<< "$task")
+curl -sS http://127.0.0.1:3000/tasks/$task_id/risk
+curl -sS http://127.0.0.1:3000/projects/$project_id/risks
+```
+
+`GET /tasks/:taskId/risk` 返回 `{ "risk": null }` 或一条包含 `risk_code`、`severity`、`trigger_facts`、`owner`、`last_activity_at` 与可执行 `next_action` 的结果；不存在的任务明确返回 `404 NOT_FOUND`。`GET /projects/:projectId/risks` 返回该项目的所有未完成风险，按严重度（`critical`、`high`、`medium`）、最后活动时间和任务 ID 稳定排序。
+
+- `OVERDUE` / `critical`：任务尚未完成且 `due_at` 早于观测时间；下一步为 `ESCALATE_OWNER`。
+- `DUE_SOON` / `high`：任务尚未完成且在 24 小时内到期（精确 24 小时边界包含在内）；下一步为 `CONFIRM_RECOVERY_PLAN`。
+- `STALE` / `medium`：任务尚未完成且关联任务、计划或执行记录已至少 7 天无审计活动；下一步为 `REQUEST_OWNER_UPDATE`。
+
+状态为 `accepted` 的已完成任务永远不会出现在风险结果中。控制台只读显示所选任务的风险代码、严重度、触发事实、责任人与处置条件，不提供升级、状态变更或交接按钮。
 
 ## 项目决策记忆与来源追溯
 

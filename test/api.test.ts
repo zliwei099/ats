@@ -24,6 +24,32 @@ test('HTTP API completes the documented approval and execution loop', async () =
   await app.close();
 });
 
+test('risk APIs expose deterministic due and inactivity escalation signals without reporting completed tasks', async () => {
+  const observedAt = '2026-08-24T12:00:00.000Z';
+  const app = buildServer(new Store(':memory:', () => new Date(observedAt)));
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  const project = (await request('POST', '/projects', { name: 'risk' })).body;
+  const overdue = (await request('POST', `/projects/${project.id}/tasks`, { title: 'overdue', actor: 'alice', dueAt: '2026-08-24T11:59:59.999Z' })).body;
+  const dueSoon = (await request('POST', `/projects/${project.id}/tasks`, { title: 'due soon', actor: 'bob', dueAt: '2026-08-25T12:00:00.000Z' })).body;
+  const safe = (await request('POST', `/projects/${project.id}/tasks`, { title: 'safe', dueAt: '2026-08-26T12:00:00.000Z' })).body;
+  const risks = await request('GET', `/projects/${project.id}/risks`);
+  assert.equal(risks.response.statusCode, 200);
+  assert.deepEqual(risks.body.map((risk: Record<string, string>) => risk.risk_code), ['OVERDUE', 'DUE_SOON']);
+  assert.equal(risks.body[0].owner, 'alice');
+  assert.equal(risks.body[0].trigger_facts.overdue_hours, 0);
+  assert.equal((await request('GET', `/tasks/${safe.id}/risk`)).body.risk, null);
+  assert.equal((await request('GET', `/tasks/${overdue.id}/risk`)).body.risk.next_action.code, 'ESCALATE_OWNER');
+  const invalidDue = await request('POST', `/projects/${project.id}/tasks`, { title: 'bad', dueAt: 'not-a-date' });
+  assert.equal(invalidDue.response.statusCode, 422); assert.equal(invalidDue.body.error, 'INVALID_DUE_DATE');
+  const missing = await request('GET', '/tasks/missing/risk');
+  assert.equal(missing.response.statusCode, 404); assert.equal(missing.body.error, 'NOT_FOUND');
+  void dueSoon;
+  await app.close();
+});
+
 test('HTTP failure and retry loop preserves evidence and enforces existing gates', async () => {
   const store = new Store(); const app = buildServer(store);
   const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
@@ -226,6 +252,7 @@ test('loopback console lists tasks and reads their existing evidence package', a
   assert.equal(script.statusCode, 200);
   assert.match(script.body, /fetch\('\/tasks'\)/);
   assert.match(script.body, /\/evidence/);
+  assert.match(script.body, /时效风险与升级信号/); assert.match(script.body, /\/risk/);
   assert.doesNotMatch(script.body, /fetch\(['"]\/(?:projects|plans|executions)/);
   await app.close();
 });

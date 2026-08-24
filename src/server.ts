@@ -19,9 +19,11 @@ export function buildServer(store = new Store()) {
     return store.decisionMemories(request.params.projectId, status);
   });
   app.post<{ Params: { decisionId: string }; Body: { replacementDecisionId: string; actor?: string } }>('/decision-memories/:decisionId/supersede', async request => store.supersedeDecisionMemory(request.params.decisionId, request.body.replacementDecisionId, request.body.actor));
-  app.post<{ Params: { projectId: string }; Body: { title: string; actor?: string } }>('/projects/:projectId/tasks', async (request, reply) => reply.code(201).send(store.createTask(request.params.projectId, request.body.title, request.body.actor)));
+  app.post<{ Params: { projectId: string }; Body: { title: string; actor?: string; dueAt?: string } }>('/projects/:projectId/tasks', async (request, reply) => reply.code(201).send(store.createTask(request.params.projectId, request.body.title, request.body.actor, request.body.dueAt)));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId', async request => store.task(request.params.taskId));
   app.get<{ Querystring: { status?: 'accepted' } }>('/tasks', async request => store.tasks(request.query.status));
+  app.get<{ Params: { taskId: string } }>('/tasks/:taskId/risk', async request => ({ risk: store.taskRisk(request.params.taskId) }));
+  app.get<{ Params: { projectId: string } }>('/projects/:projectId/risks', async request => store.projectRisks(request.params.projectId));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId/evidence', async request => store.evidencePackage(request.params.taskId));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId/dependencies', async request => store.dependencies(request.params.taskId));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId/dependency-status', async request => store.dependencyView(request.params.taskId));

@@ -59,14 +59,20 @@ function renderDependencyStatus(view) {
     + '<h3>阻塞原因</h3>' + rows(view.blocking_reasons, [{ label: '代码', key: 'code' }, { label: '关联任务', key: 'task_id' }, { label: '任务状态', key: 'status' }, { label: '执行记录', key: 'execution_id' }])
     + '<h3>执行条件</h3>' + rows(view.next_executable_conditions, [{ label: '条件', key: 'code' }, { label: '已满足', html: condition => condition.satisfied ? '是' : '否' }, { label: '关联任务', key: 'task_id' }]));
 }
+function renderRisk(result) {
+  const risk = result.risk;
+  return section('时效风险与升级信号', risk
+    ? details([['风险代码', risk.risk_code], ['严重度', risk.severity], ['负责人', risk.owner], ['最后活动', risk.last_activity_at], ['触发事实', JSON.stringify(risk.trigger_facts)], ['下一步', risk.next_action.code], ['处置条件', risk.next_action.condition]])
+    : '<p class="empty">当前未检测到时效风险。</p>');
+}
 async function loadEvidence() {
   error.textContent = '';
   if (!select.value) { content.innerHTML = '<p class="empty">选择一个任务以查看证据包。</p>'; return; }
   try {
     const taskId = encodeURIComponent(select.value);
-    const [evidenceResponse, dependencyResponse] = await Promise.all([fetch('/tasks/' + taskId + '/evidence'), fetch('/tasks/' + taskId + '/dependency-status')]);
-    if (!evidenceResponse.ok || !dependencyResponse.ok) throw new Error('请求失败（HTTP ' + (!evidenceResponse.ok ? evidenceResponse.status : dependencyResponse.status) + '）');
-    render(await evidenceResponse.json()); content.insertAdjacentHTML('afterbegin', renderDependencyStatus(await dependencyResponse.json()));
+    const [evidenceResponse, dependencyResponse, riskResponse] = await Promise.all([fetch('/tasks/' + taskId + '/evidence'), fetch('/tasks/' + taskId + '/dependency-status'), fetch('/tasks/' + taskId + '/risk')]);
+    if (!evidenceResponse.ok || !dependencyResponse.ok || !riskResponse.ok) throw new Error('请求失败（HTTP ' + (!evidenceResponse.ok ? evidenceResponse.status : !dependencyResponse.ok ? dependencyResponse.status : riskResponse.status) + '）');
+    render(await evidenceResponse.json()); content.insertAdjacentHTML('afterbegin', renderRisk(await riskResponse.json())); content.insertAdjacentHTML('afterbegin', renderDependencyStatus(await dependencyResponse.json()));
   } catch (reason) { error.textContent = reason instanceof Error ? reason.message : '无法加载证据包'; }
 }
 async function loadTasks() {
