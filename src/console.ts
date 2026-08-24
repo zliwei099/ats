@@ -23,7 +23,7 @@ export const consoleHtml = `<!doctype html>
 </head>
 <body>
   <h1>任务证据包</h1>
-  <p class="subtle">本地只读视图：计划决定、执行失败与重试、状态迁移、验收和审计记录。</p>
+  <p class="subtle">本地只读视图：负责人交接、计划决定、执行失败与重试、状态迁移、验收和审计记录。</p>
   <div class="toolbar"><select id="task-select" aria-label="任务"><option value="">选择任务</option></select><button id="reload" type="button">刷新</button></div>
   <p id="error" role="alert"></p><main id="content" aria-live="polite"><p class="empty">正在加载任务…</p></main>
   <script type="module" src="/console.js"></script>
@@ -42,7 +42,8 @@ const section = (title, html) => '<section><h2>' + text(title) + '</h2>' + html 
 function render(evidence) {
   const plan = evidence.plan ? details([['状态', evidence.plan.status], ['决策人', evidence.plan.decided_by], ['决定时间', evidence.plan.decided_at], ['内容', evidence.plan.body]]) : '<p class="empty">没有关联计划</p>';
   const acceptance = evidence.acceptance ? details([['验收人', evidence.acceptance.actor], ['验收时间', evidence.acceptance.created_at], ['审计事件', evidence.acceptance.event_id]]) : '<p class="empty">尚未验收</p>';
-  content.innerHTML = section('任务', details([['标题', evidence.task.title], ['状态', evidence.task.status], ['任务 ID', evidence.task.id], ['创建时间', evidence.task.created_at]]))
+  content.innerHTML = section('任务', details([['标题', evidence.task.title], ['状态', evidence.task.status], ['当前负责人', evidence.task.owner], ['任务 ID', evidence.task.id], ['创建时间', evidence.task.created_at]]))
+    + section('负责人责任链', rows(evidence.responsibility_chain, [{ label: '原负责人', key: 'from_owner' }, { label: '新负责人', key: 'to_owner' }, { label: '交接原因', key: 'reason' }, { label: '操作人', key: 'actor' }, { label: '时间', key: 'created_at' }, { label: '审计事件', key: 'event_id' }]))
     + section('前置依赖', rows(evidence.dependencies, [{ label: '关联任务', html: dependency => text(dependency.depends_on_title) + ' / ' + text(dependency.depends_on_task_id) }, { label: '任务状态', key: 'depends_on_status' }, { label: '阻塞是否解除', html: dependency => dependency.satisfied ? '是' : '否' }, { label: '建立时间', key: 'created_at' }, { label: '解除时间', key: 'resolved_at' }]))
     + section('阻塞的后续任务', rows(evidence.blocked_dependents, [{ label: '关联任务', html: dependency => text(dependency.task_title) + ' / ' + text(dependency.task_id) }, { label: '任务状态', key: 'task_status' }, { label: '依赖已解除', html: dependency => dependency.satisfied ? '是' : '否' }, { label: '建立时间', key: 'created_at' }, { label: '解除时间', key: 'resolved_at' }]))
     + section('计划决定', plan)

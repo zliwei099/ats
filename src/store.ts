@@ -21,6 +21,7 @@ type AuditEventRow = RecordRow & {
 
 export type EvidencePackage = {
   task: RecordRow;
+  responsibility_chain: Array<{ event_id: string; from_owner: string | null; to_owner: string; reason: string | null; actor: string; created_at: string }>;
   dependencies: Array<RecordRow>;
   blocked_dependents: Array<RecordRow>;
   plan: RecordRow | null;
@@ -50,7 +51,7 @@ export class Store {
     this.db.pragma('foreign_keys = ON');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL, status TEXT NOT NULL, owner TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS plans (id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id), body TEXT NOT NULL, status TEXT NOT NULL, decided_by TEXT, created_at TEXT NOT NULL, decided_at TEXT);
       CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), provider TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT, failure_category TEXT, failure_reason TEXT, retry_of_execution_id TEXT REFERENCES executions(id));
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_execution_per_task ON executions(task_id) WHERE status = 'active';
@@ -74,6 +75,11 @@ export class Store {
     `);
     const columns = this.db.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     if (!columns.some(column => column.name === 'sequence')) this.db.exec('ALTER TABLE audit_events ADD COLUMN sequence INTEGER');
+    const taskColumns = this.db.prepare('PRAGMA table_info(tasks)').all() as Array<{ name: string }>;
+    if (!taskColumns.some(column => column.name === 'owner')) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN owner TEXT NOT NULL DEFAULT 'system'");
+      this.db.exec("UPDATE tasks SET owner = COALESCE((SELECT actor FROM audit_events WHERE entity_type='task' AND entity_id=tasks.id AND action='created' ORDER BY sequence, created_at, id LIMIT 1), owner)");
+    }
     const executionColumns = this.db.prepare('PRAGMA table_info(executions)').all() as Array<{ name: string }>;
     if (!executionColumns.some(column => column.name === 'failure_category')) this.db.exec('ALTER TABLE executions ADD COLUMN failure_category TEXT');
     if (!executionColumns.some(column => column.name === 'failure_reason')) this.db.exec('ALTER TABLE executions ADD COLUMN failure_reason TEXT');
@@ -97,9 +103,10 @@ export class Store {
   }
   createTask(projectId: string, title: string, actor = 'system') {
     if (!this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId)) throw new DomainError('project not found', 'NOT_FOUND');
+    if (!actor?.trim()) throw new DomainError('task owner is required', 'INVALID_OWNER');
     const id = randomUUID(); const createdAt = this.now();
-    this.db.prepare('INSERT INTO tasks VALUES (?, ?, ?, ?, ?)').run(id, projectId, title, 'planned', createdAt);
-    this.audit('task', id, 'created', actor, { projectId, title }); return this.task(id);
+    this.db.prepare('INSERT INTO tasks (id, project_id, title, status, owner, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, projectId, title, 'planned', actor.trim(), createdAt);
+    this.audit('task', id, 'created', actor.trim(), { projectId, title, owner: actor.trim() }); return this.task(id);
   }
   private project(id: string) {
     const project = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as RecordRow | undefined;
@@ -185,6 +192,19 @@ export class Store {
       WHERE dependency.depends_on_task_id = ? ORDER BY dependency.created_at, dependency.id`).all(taskId) as RecordRow[];
   }
   task(id: string) { const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as RecordRow | undefined; if (!row) throw new DomainError('task not found', 'NOT_FOUND'); return row; }
+  handoffTask(taskId: string, fromOwner: string, toOwner: string, reason: string, actor = 'system') {
+    const task = this.task(taskId);
+    if (!fromOwner?.trim() || !toOwner?.trim()) throw new DomainError('source and target owners are required', 'INVALID_HANDOFF');
+    if (fromOwner.trim() === toOwner.trim()) throw new DomainError('task cannot be handed off to the same owner', 'INVALID_HANDOFF');
+    if (!reason?.trim()) throw new DomainError('handoff reason is required', 'INVALID_HANDOFF');
+    if (task.owner !== fromOwner.trim()) throw new DomainError('source owner does not match the current task owner', 'INVALID_HANDOFF');
+    if (this.db.prepare("SELECT 1 FROM executions WHERE task_id=? AND status='active'").get(taskId)) throw new DomainError('task cannot be handed off while an execution is active', 'EXECUTION_ACTIVE');
+    this.db.transaction(() => {
+      this.db.prepare('UPDATE tasks SET owner=? WHERE id=?').run(toOwner.trim(), taskId);
+      this.audit('task', taskId, 'ownership_handed_off', actor?.trim() || 'system', { fromOwner: fromOwner.trim(), toOwner: toOwner.trim(), reason: reason.trim() });
+    })();
+    return this.task(taskId);
+  }
   tasks(status?: TaskStatus) {
     return this.db.prepare(status ? 'SELECT * FROM tasks WHERE status=? ORDER BY created_at, id' : 'SELECT * FROM tasks ORDER BY created_at, id').all(...(status ? [status] : [])) as RecordRow[];
   }
@@ -232,7 +252,8 @@ export class Store {
     const id = randomUUID();
     try { this.db.prepare('INSERT INTO executions (id, task_id, provider, status, created_at, retry_of_execution_id) VALUES (?, ?, ?, ?, ?, ?)').run(id, taskId, provider, 'active', this.now(), retryOfExecutionId ?? null); }
     catch { throw new DomainError('task already has an active execution', 'EXECUTION_ACTIVE'); }
-    this.transitionTask(taskId, 'executing', actor); this.audit('execution', id, 'started', actor, { taskId, provider, retryOfExecutionId: retryOfExecutionId ?? null }); return this.execution(id);
+    const owner = String(task.owner);
+    this.transitionTask(taskId, 'executing', owner); this.audit('execution', id, 'started', owner, { taskId, provider, retryOfExecutionId: retryOfExecutionId ?? null, requestedBy: actor }); return this.execution(id);
   }
   finishExecution(id: string, actor = 'system') {
     const execution = this.execution(id); if (execution.status !== 'active') throw new DomainError('execution is not active', 'INVALID_STATE');
@@ -276,9 +297,18 @@ export class Store {
         return { event_id: event.id, from: detail.from, to: detail.to, actor: event.actor, created_at: event.created_at };
       });
     const acceptanceEvent = events.find(event => event.entity_id === taskId && event.action === 'status_changed' && (JSON.parse(event.detail) as { to?: string }).to === 'accepted');
+    const responsibilityChain = events
+      .filter(event => event.entity_id === taskId && (event.action === 'created' || event.action === 'ownership_handed_off'))
+      .map(event => {
+        const detail = JSON.parse(event.detail) as { owner?: string; fromOwner?: string; toOwner?: string; reason?: string };
+        return event.action === 'created'
+          ? { event_id: event.id, from_owner: null, to_owner: detail.owner ?? event.actor, reason: null, actor: event.actor, created_at: event.created_at }
+          : { event_id: event.id, from_owner: detail.fromOwner ?? null, to_owner: detail.toOwner ?? '', reason: detail.reason ?? null, actor: event.actor, created_at: event.created_at };
+      });
 
     return {
       task,
+      responsibility_chain: responsibilityChain,
       dependencies: this.dependencies(taskId),
       blocked_dependents: this.blockedDependents(taskId),
       plan: plan ?? null,
