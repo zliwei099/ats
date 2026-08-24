@@ -24,6 +24,7 @@ export function buildServer(store = new Store()) {
   app.get<{ Querystring: { status?: 'accepted' } }>('/tasks', async request => store.tasks(request.query.status));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId/evidence', async request => store.evidencePackage(request.params.taskId));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId/dependencies', async request => store.dependencies(request.params.taskId));
+  app.get<{ Params: { taskId: string } }>('/tasks/:taskId/dependency-status', async request => store.dependencyView(request.params.taskId));
   app.post<{ Params: { taskId: string }; Body: { fromOwner: string; toOwner: string; reason: string; actor?: string } }>('/tasks/:taskId/handoffs', async request => store.handoffTask(request.params.taskId, request.body.fromOwner, request.body.toOwner, request.body.reason, request.body.actor));
   app.post<{ Params: { taskId: string }; Body: { dependsOnTaskId: string; actor?: string } }>('/tasks/:taskId/dependencies', async (request, reply) => reply.code(201).send(store.addDependency(request.params.taskId, request.body.dependsOnTaskId, request.body.actor)));
   app.post<{ Params: { taskId: string }; Body: { body: string; actor?: string } }>('/tasks/:taskId/plans', async (request, reply) => reply.code(201).send(store.createPlan(request.params.taskId, request.body.body, request.body.actor)));

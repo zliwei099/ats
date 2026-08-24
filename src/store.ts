@@ -32,6 +32,15 @@ export type EvidencePackage = {
   decision_memories: Array<RecordRow>;
 };
 
+export type DependencyView = {
+  task: RecordRow;
+  prerequisites: Array<RecordRow>;
+  dependents: Array<RecordRow>;
+  blocking_reasons: Array<{ code: string; task_id?: string; dependency_id?: string; status?: string; execution_id?: string }>;
+  next_executable_conditions: Array<{ code: string; satisfied: boolean; task_id?: string; dependency_id?: string }>;
+  can_start: boolean;
+};
+
 export type DecisionSource = { type: 'url' | 'task' | 'audit'; reference: string };
 
 export class DomainError extends Error {
@@ -191,6 +200,38 @@ export class Store {
       FROM task_dependencies dependency JOIN tasks dependent ON dependent.id = dependency.task_id
       WHERE dependency.depends_on_task_id = ? ORDER BY dependency.created_at, dependency.id`).all(taskId) as RecordRow[];
   }
+  dependencyView(taskId: string): DependencyView {
+    const task = this.task(taskId);
+    const prerequisites = this.dependencies(taskId);
+    const dependents = this.blockedDependents(taskId);
+    const plan = this.db.prepare('SELECT status FROM plans WHERE task_id=?').get(taskId) as { status: PlanStatus } | undefined;
+    const activeExecution = this.db.prepare("SELECT id FROM executions WHERE task_id=? AND status='active' ORDER BY created_at, id LIMIT 1").get(taskId) as { id: string } | undefined;
+    const blockingReasons: DependencyView['blocking_reasons'] = [];
+    const conditions: DependencyView['next_executable_conditions'] = [];
+
+    conditions.push({ code: 'PLAN_APPROVED', satisfied: plan?.status === 'approved' });
+    if (plan?.status !== 'approved') blockingReasons.push({ code: 'PLAN_NOT_APPROVED', status: plan?.status ?? 'missing' });
+
+    for (const dependency of prerequisites) {
+      const dependencyId = String(dependency.id);
+      const prerequisiteId = String(dependency.depends_on_task_id);
+      const satisfied = Boolean(dependency.satisfied);
+      conditions.push({ code: 'PREREQUISITE_ACCEPTED', satisfied, task_id: prerequisiteId, dependency_id: dependencyId });
+      if (satisfied) continue;
+      const latestExecution = this.db.prepare('SELECT id, status, retry_of_execution_id FROM executions WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 1').get(prerequisiteId) as { id: string; status: string; retry_of_execution_id: string | null } | undefined;
+      const status = String(dependency.depends_on_status);
+      if (status === 'rejected') blockingReasons.push({ code: 'PREREQUISITE_REJECTED', task_id: prerequisiteId, dependency_id: dependencyId, status });
+      else if (latestExecution?.status === 'failed') blockingReasons.push({ code: 'PREREQUISITE_FAILED_RETRY_REQUIRED', task_id: prerequisiteId, dependency_id: dependencyId, status, execution_id: latestExecution.id });
+      else if (latestExecution?.status === 'active' && latestExecution.retry_of_execution_id) blockingReasons.push({ code: 'PREREQUISITE_RETRY_IN_PROGRESS', task_id: prerequisiteId, dependency_id: dependencyId, status, execution_id: latestExecution.id });
+      else blockingReasons.push({ code: 'PREREQUISITE_INCOMPLETE', task_id: prerequisiteId, dependency_id: dependencyId, status });
+    }
+
+    conditions.push({ code: 'TASK_READY', satisfied: task.status === 'ready' });
+    if (task.status !== 'ready') blockingReasons.push({ code: 'TASK_NOT_READY', status: String(task.status) });
+    conditions.push({ code: 'NO_ACTIVE_EXECUTION', satisfied: !activeExecution });
+    if (activeExecution) blockingReasons.push({ code: 'ACTIVE_EXECUTION', execution_id: activeExecution.id });
+    return { task, prerequisites, dependents, blocking_reasons: blockingReasons, next_executable_conditions: conditions, can_start: blockingReasons.length === 0 };
+  }
   task(id: string) { const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as RecordRow | undefined; if (!row) throw new DomainError('task not found', 'NOT_FOUND'); return row; }
   handoffTask(taskId: string, fromOwner: string, toOwner: string, reason: string, actor = 'system') {
     const task = this.task(taskId);
@@ -283,7 +324,9 @@ export class Store {
   evidencePackage(taskId: string): EvidencePackage {
     const task = this.task(taskId);
     const plan = this.db.prepare('SELECT * FROM plans WHERE task_id=?').get(taskId) as RecordRow | undefined;
-    const executions = this.db.prepare('SELECT * FROM executions WHERE task_id=? ORDER BY created_at, id').all(taskId) as RecordRow[];
+    // `created_at` can collide in a fast local workflow; rowid preserves the
+    // immutable SQLite insertion order without using a random UUID as a tie-breaker.
+    const executions = this.db.prepare('SELECT * FROM executions WHERE task_id=? ORDER BY created_at, rowid').all(taskId) as RecordRow[];
     const entityIds = [taskId, ...(plan ? [String(plan.id)] : []), ...executions.map(execution => String(execution.id))];
     const placeholders = entityIds.map(() => '?').join(', ');
     const events = this.db.prepare(`SELECT * FROM audit_events WHERE entity_id IN (${placeholders}) ORDER BY sequence IS NULL, sequence, created_at, id`).all(...entityIds) as AuditEventRow[];

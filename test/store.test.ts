@@ -43,6 +43,32 @@ test('self dependencies and dependency cycles are rejected', () => {
   store.addDependency(first, second); store.addDependency(second, third);
   mustThrow(() => store.addDependency(third, first), 'INVALID_DEPENDENCY');
 });
+test('dependency view gives stable direct relationships and explains unmet prerequisites', () => {
+  const { store, taskId: prerequisiteId } = setup(); const projectId = String(store.task(prerequisiteId).project_id);
+  const second = String(store.createTask(projectId, 'second').id); const dependentId = String(store.createTask(projectId, 'dependent').id);
+  approve(store, prerequisiteId); approve(store, second); approve(store, dependentId);
+  store.addDependency(dependentId, second); store.addDependency(dependentId, prerequisiteId);
+  const firstView = store.dependencyView(dependentId); const repeatedView = store.dependencyView(dependentId);
+  assert.deepEqual(repeatedView, firstView);
+  assert.deepEqual(firstView.prerequisites.map(item => item.depends_on_task_id), store.dependencies(dependentId).map(item => item.depends_on_task_id));
+  assert.equal(firstView.can_start, false);
+  assert.deepEqual(firstView.blocking_reasons.filter(reason => reason.code === 'PREREQUISITE_INCOMPLETE').map(reason => reason.task_id), firstView.prerequisites.map(item => item.depends_on_task_id));
+  for (const id of [prerequisiteId, second]) { const execution = store.startExecution(id, 'noop'); store.finishExecution(String(execution.id)); store.transitionTask(id, 'accepted', 'reviewer'); }
+  const unblocked = store.dependencyView(dependentId);
+  assert.equal(unblocked.can_start, true); assert.deepEqual(unblocked.blocking_reasons, []);
+  assert.ok(unblocked.next_executable_conditions.every(condition => condition.satisfied));
+});
+test('dependency view identifies failed prerequisite retry chains and invalid tasks are rejected', () => {
+  const { store, taskId: prerequisiteId } = setup(); const dependentId = String(store.createTask(String(store.task(prerequisiteId).project_id), 'dependent').id);
+  approve(store, prerequisiteId); approve(store, dependentId); store.addDependency(dependentId, prerequisiteId);
+  const execution = store.startExecution(prerequisiteId, 'noop'); store.failExecution(String(execution.id), 'timeout', 'timed out');
+  const failed = store.dependencyView(dependentId);
+  assert.ok(failed.blocking_reasons.some(reason => reason.code === 'PREREQUISITE_FAILED_RETRY_REQUIRED' && reason.execution_id === execution.id));
+  const retry = store.retryExecution(String(execution.id));
+  const retrying = store.dependencyView(dependentId);
+  assert.ok(retrying.blocking_reasons.some(reason => reason.code === 'PREREQUISITE_RETRY_IN_PROGRESS' && reason.execution_id === retry.id));
+  mustThrow(() => store.dependencyView('missing'), 'NOT_FOUND');
+});
 test('approval, execution, and acceptance state flow is audited', () => {
   const { store, taskId } = setup(); const plan = store.createPlan(taskId, 'work'); store.submitPlan(String(plan.id)); store.decidePlan(String(plan.id), true, 'reviewer');
   const execution = store.startExecution(taskId, 'noop'); store.finishExecution(String(execution.id)); store.transitionTask(taskId, 'accepted', 'reviewer');
