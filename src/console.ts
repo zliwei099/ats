@@ -23,8 +23,8 @@ export const consoleHtml = `<!doctype html>
 </head>
 <body>
   <h1>项目任务队列与任务证据包</h1>
-  <p class="subtle">本地只读视图：项目级就绪度、风险、依赖关系、负责人交接、计划决定、执行失败与重试、状态迁移、验收和审计记录。</p>
-  <div class="toolbar"><select id="task-select" aria-label="任务"><option value="">选择任务</option></select><button id="reload" type="button">刷新</button></div>
+  <p class="subtle">本地只读视图：项目级就绪度、风险、依赖关系、负责人交接、计划决定、执行失败与重试、状态迁移、验收、审计记录及执行者个人记忆。</p>
+  <div class="toolbar"><select id="task-select" aria-label="任务"><option value="">选择任务</option></select><select id="executor-select" aria-label="执行者"><option value="">选择执行者记忆</option></select><button id="reload" type="button">刷新</button></div>
   <p id="error" role="alert"></p><main id="content" aria-live="polite"><p class="empty">正在加载任务…</p></main>
   <script type="module" src="/console.js"></script>
 </body>
@@ -32,6 +32,7 @@ export const consoleHtml = `<!doctype html>
 
 export const consoleScript = `
 const select = document.querySelector('#task-select');
+const executorSelect = document.querySelector('#executor-select');
 const content = document.querySelector('#content');
 const error = document.querySelector('#error');
 const escapeHtml = ${escapeHtml.toString()};
@@ -54,6 +55,18 @@ function render(evidence) {
     + section('项目决策记忆（只读）', rows(evidence.decision_memories, [{ label: '内容', key: 'content' }, { label: '来源', html: decision => text(decision.source_type) + ': ' + text(decision.source_reference) }, { label: '适用范围', key: 'scope' }, { label: '状态', key: 'status' }, { label: '替代决策', html: decision => text(decision.superseded_by_content) + ' / ' + text(decision.superseded_by) }, { label: '创建者', key: 'created_by' }, { label: '创建时间', key: 'created_at' }]))
     + section('审计记录', rows(evidence.audit_events, [{ label: '序号', key: 'sequence' }, { label: '实体', html: event => text(event.entity_type) + ' / ' + text(event.entity_id) }, { label: '动作', key: 'action' }, { label: '责任人', key: 'actor' }, { label: '详情', html: event => '<code>' + text(JSON.stringify(event.detail)) + '</code>' }, { label: '时间', key: 'created_at' }]));
 }
+function renderPersonalMemories(executor, memories) {
+  return section('执行者个人记忆（只读）', details([['当前执行者', executor.name], ['执行者 ID', executor.id]])
+    + rows(memories, [{ label: '摘要', key: 'content' }, { label: '类型', key: 'kind' }, { label: '标签', html: memory => text(memory.tags.join(', ')) }, { label: '来源任务', key: 'source_task_id' }, { label: '来源执行', key: 'source_execution_id' }, { label: '创建时间', key: 'created_at' }]));
+}
+async function loadPersonalMemories() {
+  if (!executorSelect.value) return;
+  const executorId = encodeURIComponent(executorSelect.value);
+  const response = await fetch('/executors/' + executorId + '/personal-memories?viewerExecutorId=' + executorId);
+  if (!response.ok) throw new Error('无法读取执行者个人记忆（HTTP ' + response.status + '）');
+  const executor = executorSelect.selectedOptions[0];
+  content.insertAdjacentHTML('afterbegin', renderPersonalMemories({ id: executor.value, name: executor.textContent }, await response.json()));
+}
 function renderDependencyStatus(view) {
   const summary = view.can_start ? '<p>依赖与现有执行门禁均已满足：任务可按既有执行入口启动。</p>' : '<p class="empty">任务尚不能启动；请完成下列未满足条件。</p>';
   return section('依赖状态与下一步条件', summary + details([['当前可执行', view.can_start ? '是' : '否']])
@@ -71,7 +84,7 @@ function renderQueue(items) {
 }
 async function loadEvidence() {
   error.textContent = '';
-  if (!select.value) { content.innerHTML = '<p class="empty">选择一个任务以查看证据包。</p>'; return; }
+  if (!select.value) { content.innerHTML = '<p class="empty">选择一个任务以查看证据包。</p>'; await loadPersonalMemories(); return; }
   try {
     const taskId = encodeURIComponent(select.value);
     const [evidenceResponse, dependencyResponse, riskResponse] = await Promise.all([fetch('/tasks/' + taskId + '/evidence'), fetch('/tasks/' + taskId + '/dependency-status'), fetch('/tasks/' + taskId + '/risk')]);
@@ -79,7 +92,7 @@ async function loadEvidence() {
     const evidence = await evidenceResponse.json();
     const queueResponse = await fetch('/projects/' + encodeURIComponent(evidence.task.project_id) + '/queue');
     if (!queueResponse.ok) throw new Error('无法读取项目执行队列（HTTP ' + queueResponse.status + '）');
-    render(evidence); content.insertAdjacentHTML('afterbegin', renderRisk(await riskResponse.json())); content.insertAdjacentHTML('afterbegin', renderDependencyStatus(await dependencyResponse.json())); content.insertAdjacentHTML('afterbegin', renderQueue(await queueResponse.json()));
+    render(evidence); content.insertAdjacentHTML('afterbegin', renderRisk(await riskResponse.json())); content.insertAdjacentHTML('afterbegin', renderDependencyStatus(await dependencyResponse.json())); content.insertAdjacentHTML('afterbegin', renderQueue(await queueResponse.json())); await loadPersonalMemories();
   } catch (reason) { error.textContent = reason instanceof Error ? reason.message : '无法加载证据包'; }
 }
 async function loadTasks() {
@@ -90,5 +103,10 @@ async function loadTasks() {
     if (selected && tasks.some(task => task.id === selected)) { select.value = selected; await loadEvidence(); } else if (!tasks.length) { content.innerHTML = '<p class="empty">当前没有任务。</p>'; }
   } catch (reason) { error.textContent = reason instanceof Error ? reason.message : '无法加载任务'; content.innerHTML = ''; }
 }
-select.addEventListener('change', loadEvidence); document.querySelector('#reload').addEventListener('click', () => loadEvidence()); loadTasks();
+async function loadExecutors() {
+  const response = await fetch('/executors'); if (!response.ok) throw new Error('无法读取执行者');
+  const executors = await response.json();
+  executorSelect.innerHTML = '<option value="">选择执行者记忆</option>' + executors.map(executor => '<option value="' + text(executor.id) + '">' + text(executor.name) + ' / ' + text(executor.id) + '</option>').join('');
+}
+select.addEventListener('change', loadEvidence); executorSelect.addEventListener('change', loadEvidence); document.querySelector('#reload').addEventListener('click', () => loadEvidence()); Promise.all([loadTasks(), loadExecutors()]).catch(reason => { error.textContent = reason instanceof Error ? reason.message : '无法加载控制台'; });
 `;

@@ -1,17 +1,24 @@
 import Fastify from 'fastify';
 import { consoleHtml, consoleScript } from './console.js';
-import { DecisionSource, DomainError, FailureCategory, Store } from './store.js';
+import { DecisionSource, DomainError, FailureCategory, PersonalMemoryInput, Store } from './store.js';
 
 export function buildServer(store = new Store()) {
   const app = Fastify({ logger: false });
   app.setErrorHandler((error, _request, reply) => {
-    if (error instanceof DomainError) return reply.code(error.code === 'NOT_FOUND' ? 404 : error.code === 'CONFLICT' || error.code === 'EXECUTION_ACTIVE' ? 409 : 422).send({ error: error.code, message: error.message });
+    if (error instanceof DomainError) return reply.code(error.code === 'NOT_FOUND' ? 404 : error.code === 'MEMORY_ACCESS_DENIED' ? 403 : error.code === 'CONFLICT' || error.code === 'EXECUTION_ACTIVE' ? 409 : 422).send({ error: error.code, message: error.message });
     return reply.code(500).send({ error: 'INTERNAL_ERROR' });
   });
   app.get('/health', async () => ({ ok: true }));
   app.get('/console', async (_request, reply) => reply.type('text/html; charset=utf-8').send(consoleHtml));
   app.get('/console.js', async (_request, reply) => reply.type('application/javascript; charset=utf-8').send(consoleScript));
   app.post<{ Body: { name: string; actor?: string } }>('/projects', async (request, reply) => reply.code(201).send(store.createProject(request.body.name, request.body.actor)));
+  app.post<{ Body: { id: string; name: string; actor?: string } }>('/executors', async (request, reply) => reply.code(201).send(store.createExecutor(request.body.id, request.body.name, request.body.actor)));
+  app.get('/executors', async () => store.executors());
+  app.post<{ Params: { executorId: string }; Body: PersonalMemoryInput }>('/executors/:executorId/personal-memories', async (request, reply) => reply.code(201).send(store.createPersonalMemory(request.params.executorId, request.body)));
+  app.get<{ Params: { executorId: string }; Querystring: { viewerExecutorId?: string } }>('/executors/:executorId/personal-memories', async request => {
+    if (!request.query.viewerExecutorId?.trim()) throw new DomainError('viewerExecutorId is required', 'INVALID_MEMORY_ACCESS');
+    return store.personalMemories(request.params.executorId, request.query.viewerExecutorId);
+  });
   app.post<{ Params: { projectId: string }; Body: { content: string; source: DecisionSource; scope: string; actor?: string } }>('/projects/:projectId/decision-memories', async (request, reply) => reply.code(201).send(store.createDecisionMemory(request.params.projectId, request.body.content, request.body.source, request.body.scope, request.body.actor)));
   app.get<{ Params: { projectId: string }; Querystring: { status?: 'active' | 'superseded' | 'all' } }>('/projects/:projectId/decision-memories', async request => {
     const status = request.query.status ?? 'active';
