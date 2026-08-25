@@ -1,6 +1,34 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildServer } from '../src/server.js';
+
+test('personal memory HTTP endpoints isolate executors, reject invalid input, and stay read-only in the console', async () => {
+  const app = buildServer(new Store());
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  await request('POST', '/executors', { id: 'alice', name: 'Alice' });
+  await request('POST', '/executors', { id: 'bob', name: 'Bob' });
+  const project = (await request('POST', '/projects', { name: 'memories' })).body;
+  const task = (await request('POST', `/projects/${project.id}/tasks`, { title: 'source' })).body;
+  const alice = await request('POST', '/executors/alice/personal-memories', { content: 'Preserve audit evidence', kind: 'lesson', tags: ['audit'], sourceTaskId: task.id });
+  await request('POST', '/executors/alice/personal-memories', { content: 'Stable ordering matters', tags: ['api'] });
+  await request('POST', '/executors/bob/personal-memories', { content: 'Bob-only context', tags: ['privacy'] });
+  assert.equal(alice.response.statusCode, 201);
+  const own = await request('GET', '/executors/alice/personal-memories?viewerExecutorId=alice');
+  assert.equal(own.response.statusCode, 200); assert.equal(own.body.length, 2); assert.ok(own.body.every((memory: Record<string, string>) => memory.executor_id === 'alice'));
+  const cross = await request('GET', '/executors/alice/personal-memories?viewerExecutorId=bob');
+  assert.equal(cross.response.statusCode, 403); assert.equal(cross.body.error, 'MEMORY_ACCESS_DENIED');
+  assert.equal((await request('GET', '/executors/alice/personal-memories')).response.statusCode, 422);
+  assert.equal((await request('POST', '/executors/missing/personal-memories', { content: 'no' })).response.statusCode, 404);
+  assert.equal((await request('POST', '/executors/alice/personal-memories', { content: ' ' })).response.statusCode, 422);
+  assert.equal((await request('POST', '/executors/alice/personal-memories', { content: 'invalid source', sourceTaskId: 'missing' })).response.statusCode, 404);
+  const audit = await request('GET', '/audit/alice'); assert.ok(audit.body.some((event: Record<string, string>) => event.action === 'personal_memories_accessed'));
+  const script = await app.inject({ method: 'GET', url: '/console.js' });
+  assert.match(script.body, /执行者个人记忆（只读）/); assert.match(script.body, /personal-memories\?viewerExecutorId/); assert.doesNotMatch(script.body, /personal-memories.*POST/);
+  await app.close();
+});
 import { Store } from '../src/store.js';
 
 test('HTTP API completes the documented approval and execution loop', async () => {

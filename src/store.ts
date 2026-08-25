@@ -67,6 +67,8 @@ export type ProjectQueueItem = {
 };
 
 export type DecisionSource = { type: 'url' | 'task' | 'audit'; reference: string };
+export type PersonalMemoryInput = { content: string; kind?: string; tags?: string[]; sourceTaskId?: string; sourceExecutionId?: string; actor?: string };
+export type PersonalMemory = RecordRow & { id: string; executor_id: string; content: string; tags: string[] };
 
 export class DomainError extends Error {
   constructor(message: string, readonly code = 'DOMAIN_ERROR') { super(message); }
@@ -105,6 +107,19 @@ export class Store {
         superseded_by TEXT REFERENCES decision_memories(id)
       );
       CREATE INDEX IF NOT EXISTS decision_memories_project_status_created ON decision_memories(project_id, status, created_at, id);
+      CREATE TABLE IF NOT EXISTS executors (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS personal_memories (
+        id TEXT PRIMARY KEY,
+        executor_id TEXT NOT NULL REFERENCES executors(id),
+        source_task_id TEXT REFERENCES tasks(id),
+        source_execution_id TEXT REFERENCES executions(id),
+        content TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        tags TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        created_sequence INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS personal_memories_executor_order ON personal_memories(executor_id, created_at, created_sequence);
       CREATE TABLE IF NOT EXISTS audit_events (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, actor TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL, sequence INTEGER);
     `);
     const planColumns = this.db.prepare('PRAGMA table_info(plans)').all() as Array<{ name: string }>;
@@ -163,6 +178,53 @@ export class Store {
     const project = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as RecordRow | undefined;
     if (!project) throw new DomainError('project not found', 'NOT_FOUND');
     return project;
+  }
+  createExecutor(id: string, name: string, actor = 'system') {
+    if (!id?.trim() || !name?.trim()) throw new DomainError('executor id and name are required', 'INVALID_EXECUTOR');
+    const executorId = id.trim();
+    if (this.db.prepare('SELECT 1 FROM executors WHERE id=?').get(executorId)) throw new DomainError('executor already exists', 'CONFLICT');
+    const createdAt = this.now();
+    this.db.prepare('INSERT INTO executors (id, name, created_at) VALUES (?, ?, ?)').run(executorId, name.trim(), createdAt);
+    this.audit('executor', executorId, 'created', actor?.trim() || 'system', { name: name.trim() });
+    return this.executor(executorId);
+  }
+  private executor(id: string) {
+    const executor = this.db.prepare('SELECT * FROM executors WHERE id=?').get(id) as RecordRow | undefined;
+    if (!executor) throw new DomainError('executor not found', 'NOT_FOUND');
+    return executor;
+  }
+  executors() { return this.db.prepare('SELECT * FROM executors ORDER BY created_at, id').all() as RecordRow[]; }
+  createPersonalMemory(executorId: string, input: PersonalMemoryInput) {
+    this.executor(executorId);
+    if (!input?.content?.trim()) throw new DomainError('memory content is required', 'INVALID_MEMORY');
+    const sourceTaskId = input.sourceTaskId?.trim() || null;
+    const sourceExecutionId = input.sourceExecutionId?.trim() || null;
+    if (sourceTaskId) this.task(sourceTaskId);
+    if (sourceExecutionId) {
+      const execution = this.execution(sourceExecutionId);
+      if (sourceTaskId && String(execution.task_id) !== sourceTaskId) throw new DomainError('memory source execution does not belong to source task', 'INVALID_MEMORY_SOURCE');
+    }
+    const tags = input.tags === undefined ? [] : input.tags;
+    if (!Array.isArray(tags) || tags.some(tag => typeof tag !== 'string' || !tag.trim())) throw new DomainError('memory tags must be non-empty strings', 'INVALID_MEMORY');
+    const kind = input.kind?.trim() || 'experience';
+    const id = randomUUID(); const createdAt = this.now(); const actor = input.actor?.trim() || executorId;
+    this.db.prepare(`INSERT INTO personal_memories (id, executor_id, source_task_id, source_execution_id, content, kind, tags, created_at, created_sequence)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(created_sequence), 0) + 1 FROM personal_memories))`)
+      .run(id, executorId, sourceTaskId, sourceExecutionId, input.content.trim(), kind, JSON.stringify(tags.map(tag => tag.trim())), createdAt);
+    this.audit('personal_memory', id, 'created', actor, { executorId, sourceTaskId, sourceExecutionId, kind, tags: tags.map(tag => tag.trim()) });
+    return this.personalMemory(id);
+  }
+  private personalMemory(id: string): PersonalMemory {
+    const memory = this.db.prepare('SELECT * FROM personal_memories WHERE id=?').get(id) as RecordRow | undefined;
+    if (!memory) throw new DomainError('personal memory not found', 'NOT_FOUND');
+    return { ...memory, id: String(memory.id), executor_id: String(memory.executor_id), content: String(memory.content), tags: JSON.parse(String(memory.tags)) as string[] };
+  }
+  personalMemories(executorId: string, viewerExecutorId: string): PersonalMemory[] {
+    this.executor(executorId); this.executor(viewerExecutorId);
+    if (executorId !== viewerExecutorId) throw new DomainError('cross-executor memory access is not permitted', 'MEMORY_ACCESS_DENIED');
+    const memories = this.db.prepare('SELECT * FROM personal_memories WHERE executor_id=? ORDER BY created_at, created_sequence').all(executorId) as RecordRow[];
+    this.audit('executor', executorId, 'personal_memories_accessed', viewerExecutorId, { count: memories.length });
+    return memories.map(memory => ({ ...memory, id: String(memory.id), executor_id: String(memory.executor_id), content: String(memory.content), tags: JSON.parse(String(memory.tags)) as string[] }));
   }
   private validateDecisionSource(source: DecisionSource) {
     if (!source || !['url', 'task', 'audit'].includes(source.type) || typeof source.reference !== 'string' || !source.reference.trim()) {

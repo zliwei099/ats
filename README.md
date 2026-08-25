@@ -152,6 +152,21 @@ curl -sS http://127.0.0.1:3000/projects/$project_id/risks
 
 决策记忆是项目级、可审计的协作记录，不是个人长期记忆。每条记录须包含简明内容、适用范围，以及结构化来源：`url`（完整 URL）、`task`（任务引用）或 `audit`（审计引用）。不得写入 API token、密钥、个人隐私或执行者私有经历。
 
+## 执行者个人记忆与隔离审计
+
+个人记忆只属于已注册的执行者，独立于项目决策记忆。创建时 URL 中必须指定执行者；内容不能为空，`kind` 和字符串 `tags` 可选，`sourceTaskId` / `sourceExecutionId` 可选但若提供必须是本地已存在的记录（两者同时提供时执行必须属于该任务）。同一执行者的列表按 `created_at, created_sequence` 稳定排序。读取还必须显式传入同一执行者的 `viewerExecutorId`；跨执行者读取返回 `403 MEMORY_ACCESS_DENIED`，不存在的执行者、任务或执行返回 `404`。创建和每次读取均追加不可变审计事件。
+
+```sh
+curl -sS -X POST http://127.0.0.1:3000/executors -H 'content-type: application/json' -d '{"id":"executor-a","name":"Executor A"}'
+curl -sS -X POST http://127.0.0.1:3000/executors -H 'content-type: application/json' -d '{"id":"executor-b","name":"Executor B"}'
+curl -sS -X POST http://127.0.0.1:3000/executors/executor-a/personal-memories -H 'content-type: application/json' -d "{\"content\":\"Use approved plans before starting\",\"kind\":\"lesson\",\"tags\":[\"workflow\"],\"sourceTaskId\":\"$task_id\"}"
+curl -sS 'http://127.0.0.1:3000/executors/executor-a/personal-memories?viewerExecutorId=executor-a'
+curl -sS -i 'http://127.0.0.1:3000/executors/executor-a/personal-memories?viewerExecutorId=executor-b' # 403
+curl -sS http://127.0.0.1:3000/audit/executor-a
+```
+
+浏览器验收：启动本地服务后访问 `http://127.0.0.1:3000/console`，从“执行者记忆”下拉框选择一个执行者。控制台只使用 `GET /executors` 和受同一执行者 `viewerExecutorId` 约束的 `GET /executors/:executorId/personal-memories`，展示摘要、类型/标签及任务/执行来源，不提供记忆写入入口，也不会读取外部服务。
+
 ```sh
 decision=$(curl -sS -X POST http://127.0.0.1:3000/projects/$project_id/decision-memories -H 'content-type: application/json' -d '{"content":"本地 MVP 使用 SQLite","source":{"type":"url","reference":"https://example.test/adr/sqlite"},"scope":"本地 MVP","actor":"architect"}')
 decision_id=$(node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id))' <<< "$decision")

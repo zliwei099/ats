@@ -153,6 +153,22 @@ test('decision memories retain creation order when timestamps collide', () => {
   assert.deepEqual(store.decisionMemories(String(project.id), 'all').map(memory => memory.id), [first.id, second.id]);
 });
 
+test('personal memories are isolated by executor, validate traceable sources, and audit accesses', () => {
+  const { store, taskId } = setup();
+  store.createExecutor('alice', 'Alice'); store.createExecutor('bob', 'Bob');
+  const first = store.createPersonalMemory('alice', { content: 'Use an approved plan first', kind: 'lesson', tags: ['workflow'], sourceTaskId: taskId });
+  const second = store.createPersonalMemory('alice', { content: 'Keep evidence stable', tags: ['testing'] });
+  store.createPersonalMemory('bob', { content: 'Do not share private context', tags: ['privacy'] });
+  assert.deepEqual(store.personalMemories('alice', 'alice').map(memory => memory.id), [first.id, second.id]);
+  assert.deepEqual(store.personalMemories('bob', 'bob').map(memory => memory.content), ['Do not share private context']);
+  mustThrow(() => store.personalMemories('alice', 'bob'), 'MEMORY_ACCESS_DENIED');
+  mustThrow(() => store.createPersonalMemory('missing', { content: 'no' }), 'NOT_FOUND');
+  mustThrow(() => store.createPersonalMemory('alice', { content: '   ' }), 'INVALID_MEMORY');
+  mustThrow(() => store.createPersonalMemory('alice', { content: 'bad source', sourceTaskId: 'missing' }), 'NOT_FOUND');
+  assert.ok(store.auditEvents('alice').some((event: any) => event.action === 'personal_memories_accessed'));
+  assert.ok(store.auditEvents(String(first.id)).some((event: any) => event.action === 'created'));
+});
+
 test('task risks respect exact time boundaries, stable severity sorting, owners, and completed-task exclusion', () => {
   const createdAt = new Date('2026-08-17T12:00:00.000Z');
   const observedAt = new Date('2026-08-24T12:00:00.000Z');
