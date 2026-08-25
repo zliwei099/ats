@@ -82,6 +82,10 @@ function renderRisk(result) {
 function renderQueue(items) {
   return section('项目执行队列（只读）', rows(items, [{ label: '队列状态', key: 'queue_status' }, { label: '任务', html: item => text(item.title) + ' / ' + text(item.task_id) }, { label: '负责人', key: 'owner' }, { label: '任务状态', key: 'task_status' }, { label: '原因代码', key: 'reason_code' }, { label: '触发事实', html: item => '<code>' + text(JSON.stringify(item.trigger_facts)) + '</code>' }, { label: '下一步', html: item => text(item.next_action.code) + '：' + text(item.next_action.condition) }]));
 }
+function renderDeliveryReadiness(report) {
+  return section('项目交付就绪度（只读）', details([['结论', report.conclusion], ['项目状态', report.project_status], ['已验收任务', report.accepted_task_count], ['未完成任务', report.outstanding_task_count]])
+    + '<h3>阻塞项与下一步</h3>' + rows(report.blockers, [{ label: '代码', key: 'code' }, { label: '任务', html: item => text(item.title) + ' / ' + text(item.task_id) }, { label: '负责人', key: 'owner' }, { label: '事实', html: item => '<code>' + text(JSON.stringify(item.facts)) + '</code>' }, { label: '下一步', html: item => text(item.next_action.code) + '：' + text(item.next_action.condition) }]));
+}
 async function loadEvidence() {
   error.textContent = '';
   if (!select.value) { content.innerHTML = '<p class="empty">选择一个任务以查看证据包。</p>'; await loadPersonalMemories(); return; }
@@ -90,9 +94,9 @@ async function loadEvidence() {
     const [evidenceResponse, dependencyResponse, riskResponse] = await Promise.all([fetch('/tasks/' + taskId + '/evidence'), fetch('/tasks/' + taskId + '/dependency-status'), fetch('/tasks/' + taskId + '/risk')]);
     if (!evidenceResponse.ok || !dependencyResponse.ok || !riskResponse.ok) throw new Error('请求失败（HTTP ' + (!evidenceResponse.ok ? evidenceResponse.status : !dependencyResponse.ok ? dependencyResponse.status : riskResponse.status) + '）');
     const evidence = await evidenceResponse.json();
-    const queueResponse = await fetch('/projects/' + encodeURIComponent(evidence.task.project_id) + '/queue');
-    if (!queueResponse.ok) throw new Error('无法读取项目执行队列（HTTP ' + queueResponse.status + '）');
-    render(evidence); content.insertAdjacentHTML('afterbegin', renderRisk(await riskResponse.json())); content.insertAdjacentHTML('afterbegin', renderDependencyStatus(await dependencyResponse.json())); content.insertAdjacentHTML('afterbegin', renderQueue(await queueResponse.json())); await loadPersonalMemories();
+    const [queueResponse, readinessResponse] = await Promise.all([fetch('/projects/' + encodeURIComponent(evidence.task.project_id) + '/queue'), fetch('/projects/' + encodeURIComponent(evidence.task.project_id) + '/delivery-readiness')]);
+    if (!queueResponse.ok || !readinessResponse.ok) throw new Error('无法读取项目只读概览（HTTP ' + (!queueResponse.ok ? queueResponse.status : readinessResponse.status) + '）');
+    render(evidence); content.insertAdjacentHTML('afterbegin', renderRisk(await riskResponse.json())); content.insertAdjacentHTML('afterbegin', renderDependencyStatus(await dependencyResponse.json())); content.insertAdjacentHTML('afterbegin', renderQueue(await queueResponse.json())); content.insertAdjacentHTML('afterbegin', renderDeliveryReadiness(await readinessResponse.json())); await loadPersonalMemories();
   } catch (reason) { error.textContent = reason instanceof Error ? reason.message : '无法加载证据包'; }
 }
 async function loadTasks() {

@@ -193,3 +193,41 @@ test('task risks respect exact time boundaries, stable severity sorting, owners,
   assert.deepEqual(new Set(store.projectRisks(projectId, observedAt).map(risk => risk.task_id)), new Set([String(dueSoon.id), String(exact.id), String(stale.id)]));
   assert.throws(() => store.createTask(projectId, 'bad', 'owner', 'invalid-date'), (error: any) => error.code === 'INVALID_DUE_DATE');
 });
+
+test('delivery readiness derives stable actionable blockers and becomes ready only after acceptance', () => {
+  const now = new Date('2026-08-24T12:00:00.000Z');
+  const store = new Store(':memory:', () => now); const project = store.createProject('delivery'); const projectId = String(project.id);
+  const approval = store.createTask(projectId, 'approval', 'planner');
+  const prerequisite = store.createTask(projectId, 'prerequisite', 'dependency-owner');
+  const dependent = store.createTask(projectId, 'dependent', 'delivery-owner');
+  const active = store.createTask(projectId, 'active', 'executor');
+  const review = store.createTask(projectId, 'review', 'verifier');
+  const risk = store.createTask(projectId, 'risk', 'risk-owner', '2026-08-24T11:00:00.000Z');
+  for (const task of [prerequisite, dependent, active, review, risk]) approve(store, String(task.id));
+  store.addDependency(String(dependent.id), String(prerequisite.id));
+  store.startExecution(String(active.id), 'noop');
+  const reviewExecution = store.startExecution(String(review.id), 'noop'); store.finishExecution(String(reviewExecution.id));
+  const first = store.deliveryReadiness(projectId, now); const second = store.deliveryReadiness(projectId, now);
+  assert.deepEqual(second, first);
+  assert.equal(first.conclusion, 'not_ready'); assert.equal(first.project_status, 'in_progress');
+  assert.deepEqual(first.blockers.map(item => item.code), [...first.blockers.map(item => item.code)].sort());
+  assert.ok(first.blockers.some(item => item.code === 'PLAN_APPROVAL_REQUIRED' && item.task_id === approval.id && item.owner === 'planner'));
+  assert.ok(first.blockers.some(item => item.code === 'PREREQUISITE_INCOMPLETE' && item.task_id === dependent.id && item.next_action.code === 'SATISFY_PREREQUISITE'));
+  assert.ok(first.blockers.some(item => item.code === 'ACTIVE_EXECUTION' && item.task_id === active.id));
+  assert.ok(first.blockers.some(item => item.code === 'INDEPENDENT_VERIFICATION_REQUIRED' && item.task_id === review.id && item.next_action.code === 'REVIEW_AND_ACCEPT'));
+  assert.ok(first.blockers.some(item => item.code === 'OVERDUE' && item.task_id === risk.id));
+  const empty = store.createProject('empty');
+  assert.deepEqual(store.deliveryReadiness(String(empty.id), now).blockers.map(item => item.code), ['PROJECT_HAS_NO_TASKS']);
+  for (const task of [prerequisite, dependent, active, review, risk]) {
+    const id = String(task.id); const status = String(store.task(id).status);
+    if (status === 'executing') { const execution = store.evidencePackage(id).executions.find(item => item.status === 'active')!; store.finishExecution(String(execution.id)); }
+    if (store.task(id).status === 'awaiting_acceptance') store.transitionTask(id, 'accepted', 'reviewer');
+  }
+  approve(store, String(approval.id)); const approvalExecution = store.startExecution(String(approval.id), 'noop'); store.finishExecution(String(approvalExecution.id)); store.transitionTask(String(approval.id), 'accepted', 'reviewer');
+  for (const task of [prerequisite, dependent, risk]) {
+    const id = String(task.id); const execution = store.startExecution(id, 'noop'); store.finishExecution(String(execution.id)); store.transitionTask(id, 'accepted', 'reviewer');
+  }
+  const ready = store.deliveryReadiness(projectId, now);
+  assert.equal(ready.conclusion, 'ready'); assert.equal(ready.project_status, 'accepted'); assert.deepEqual(ready.blockers, []);
+  mustThrow(() => store.deliveryReadiness('missing', now), 'NOT_FOUND');
+});

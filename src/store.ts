@@ -66,6 +66,24 @@ export type ProjectQueueItem = {
   next_action: { code: string; condition: string };
 };
 
+export type DeliveryReadinessBlocker = {
+  code: string;
+  task_id: string | null;
+  title: string | null;
+  owner: string | null;
+  facts: Record<string, unknown>;
+  next_action: { code: string; condition: string };
+};
+
+export type DeliveryReadinessReport = {
+  project: { id: string; name: string };
+  project_status: 'empty' | 'in_progress' | 'accepted';
+  conclusion: 'ready' | 'not_ready';
+  accepted_task_count: number;
+  outstanding_task_count: number;
+  blockers: DeliveryReadinessBlocker[];
+};
+
 export type DecisionSource = { type: 'url' | 'task' | 'audit'; reference: string };
 export type PersonalMemoryInput = { content: string; kind?: string; tags?: string[]; sourceTaskId?: string; sourceExecutionId?: string; actor?: string };
 export type PersonalMemory = RecordRow & { id: string; executor_id: string; content: string; tags: string[] };
@@ -396,6 +414,53 @@ export class Store {
           || String(left.trigger_facts.last_activity_at).localeCompare(String(right.trigger_facts.last_activity_at))
         : 0)
       || left.task_id.localeCompare(right.task_id));
+  }
+  deliveryReadiness(projectId: string, now = this.clock()): DeliveryReadinessReport {
+    const project = this.project(projectId);
+    const tasks = this.db.prepare('SELECT * FROM tasks WHERE project_id=? ORDER BY id').all(projectId) as RecordRow[];
+    const blockers: DeliveryReadinessBlocker[] = [];
+    const blocker = (code: string, task: RecordRow | null, facts: Record<string, unknown>, next_action: DeliveryReadinessBlocker['next_action']) => {
+      blockers.push({ code, task_id: task ? String(task.id) : null, title: task ? String(task.title) : null, owner: task ? String(task.owner) : null, facts, next_action });
+    };
+
+    if (!tasks.length) {
+      blocker('PROJECT_HAS_NO_TASKS', null, { project_id: projectId }, { code: 'DEFINE_DELIVERY_SCOPE', condition: 'Add at least one task before a project can be assessed for delivery.' });
+    }
+    for (const task of tasks) {
+      if (task.status === 'accepted') continue;
+      const taskId = String(task.id);
+      const risk = this.riskForTask(task, now);
+      if (risk) blocker(risk.risk_code, task, risk.trigger_facts, risk.next_action);
+
+      const view = this.dependencyView(taskId);
+      const plan = this.currentPlan(taskId);
+      if (plan?.status !== 'approved') {
+        blocker('PLAN_APPROVAL_REQUIRED', task, { plan_status: plan?.status ?? 'missing', task_status: task.status }, { code: 'SUBMIT_OR_APPROVE_PLAN', condition: 'The current task plan must be approved before delivery can be ready.' });
+      }
+      for (const reason of view.blocking_reasons.filter(reason => reason.code.startsWith('PREREQUISITE_'))) {
+        blocker(reason.code, task, { dependency_id: reason.dependency_id, prerequisite_task_id: reason.task_id, prerequisite_status: reason.status, execution_id: reason.execution_id }, { code: 'SATISFY_PREREQUISITE', condition: 'The referenced prerequisite must complete its acceptance loop.' });
+      }
+      const active = view.blocking_reasons.find(reason => reason.code === 'ACTIVE_EXECUTION');
+      if (active) {
+        blocker('ACTIVE_EXECUTION', task, { execution_id: active.execution_id, task_status: task.status }, { code: 'WAIT_FOR_ACTIVE_EXECUTION', condition: 'The active execution must finish or fail before delivery can be assessed as ready.' });
+      } else if (task.status === 'awaiting_acceptance') {
+        blocker('INDEPENDENT_VERIFICATION_REQUIRED', task, { task_status: task.status, acceptance_evidence: 'missing' }, { code: 'REVIEW_AND_ACCEPT', condition: 'An independent reviewer must record acceptance evidence for the completed execution.' });
+      } else if (task.status === 'ready') {
+        blocker('EXECUTION_NOT_COMPLETED', task, { task_status: task.status }, { code: 'START_EXECUTION', condition: 'Start and complete the approved task through the existing execution flow.' });
+      } else if (task.status === 'rejected') {
+        blocker('REPLAN_REQUIRED', task, { task_status: task.status }, { code: 'RESTORE_READY_STATE', condition: 'Revise the task through the existing plan and acceptance workflow.' });
+      }
+    }
+    blockers.sort((left, right) => left.code.localeCompare(right.code) || String(left.task_id ?? '').localeCompare(String(right.task_id ?? '')) || String(left.owner ?? '').localeCompare(String(right.owner ?? '')));
+    const acceptedTaskCount = tasks.filter(task => task.status === 'accepted').length;
+    return {
+      project: { id: String(project.id), name: String(project.name) },
+      project_status: tasks.length === 0 ? 'empty' : acceptedTaskCount === tasks.length ? 'accepted' : 'in_progress',
+      conclusion: blockers.length === 0 ? 'ready' : 'not_ready',
+      accepted_task_count: acceptedTaskCount,
+      outstanding_task_count: tasks.length - acceptedTaskCount,
+      blockers
+    };
   }
   private queueItem(task: RecordRow, now: Date): ProjectQueueItem {
     const taskId = String(task.id); const base = { task_id: taskId, title: String(task.title), owner: String(task.owner), task_status: String(task.status) };

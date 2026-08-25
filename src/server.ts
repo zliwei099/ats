@@ -32,6 +32,7 @@ export function buildServer(store = new Store()) {
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId/risk', async request => ({ risk: store.taskRisk(request.params.taskId) }));
   app.get<{ Params: { projectId: string } }>('/projects/:projectId/risks', async request => store.projectRisks(request.params.projectId));
   app.get<{ Params: { projectId: string } }>('/projects/:projectId/queue', async request => store.projectQueue(request.params.projectId));
+  app.get<{ Params: { projectId: string } }>('/projects/:projectId/delivery-readiness', async request => store.deliveryReadiness(request.params.projectId));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId/evidence', async request => store.evidencePackage(request.params.taskId));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId/plans', async request => store.planHistory(request.params.taskId));
   app.get<{ Params: { taskId: string } }>('/tasks/:taskId/dependencies', async request => store.dependencies(request.params.taskId));

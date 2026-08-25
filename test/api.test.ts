@@ -353,6 +353,31 @@ test('project queue is read-only, classifies readiness from existing gates, and 
   await app.close();
 });
 
+test('delivery readiness API is read-only, actionable, and rejects unknown projects', async () => {
+  const now = new Date('2026-08-24T12:00:00.000Z');
+  const app = buildServer(new Store(':memory:', () => now));
+  const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
+    const response = await app.inject({ method, url, payload: body === undefined ? undefined : JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+    return { response, body: JSON.parse(response.body) as Record<string, any> };
+  };
+  const project = (await request('POST', '/projects', { name: 'release' })).body;
+  const pending = (await request('POST', `/projects/${project.id}/tasks`, { title: 'pending approval', actor: 'planner' })).body;
+  const review = (await request('POST', `/projects/${project.id}/tasks`, { title: 'independent review', actor: 'reviewer' })).body;
+  const plan = (await request('POST', `/tasks/${review.id}/plans`, { body: 'approved plan' })).body;
+  await request('POST', `/plans/${plan.id}/submit`, {}); await request('POST', `/plans/${plan.id}/approve`, { actor: 'approver' });
+  const execution = (await request('POST', `/tasks/${review.id}/executions`, { provider: 'noop' })).body;
+  await request('POST', `/executions/${execution.id}/finish`, {});
+  const report = await request('GET', `/projects/${project.id}/delivery-readiness`);
+  assert.equal(report.response.statusCode, 200); assert.equal(report.body.conclusion, 'not_ready');
+  assert.ok(report.body.blockers.some((item: Record<string, any>) => item.code === 'PLAN_APPROVAL_REQUIRED' && item.task_id === pending.id && item.owner === 'planner'));
+  assert.ok(report.body.blockers.some((item: Record<string, any>) => item.code === 'INDEPENDENT_VERIFICATION_REQUIRED' && item.task_id === review.id && item.next_action.code === 'REVIEW_AND_ACCEPT'));
+  assert.deepEqual((await request('GET', `/projects/${project.id}/delivery-readiness`)).body, report.body);
+  assert.equal((await request('GET', '/projects/missing/delivery-readiness')).response.statusCode, 404);
+  const script = await app.inject({ method: 'GET', url: '/console.js' });
+  assert.match(script.body, /项目交付就绪度/); assert.match(script.body, /delivery-readiness/); assert.doesNotMatch(script.body, /delivery-readiness.*POST/);
+  await app.close();
+});
+
 test('project decision memories retain sources, stable history, and supersession without weakening workflow gates', async () => {
   const app = buildServer(new Store());
   const request = async (method: 'GET' | 'POST', url: string, body?: object) => {
