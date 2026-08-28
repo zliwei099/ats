@@ -371,10 +371,11 @@ test('delivery readiness API is read-only, actionable, and rejects unknown proje
   assert.equal(report.response.statusCode, 200); assert.equal(report.body.conclusion, 'not_ready');
   assert.ok(report.body.blockers.some((item: Record<string, any>) => item.code === 'PLAN_APPROVAL_REQUIRED' && item.task_id === pending.id && item.owner === 'planner'));
   assert.ok(report.body.blockers.some((item: Record<string, any>) => item.code === 'INDEPENDENT_VERIFICATION_REQUIRED' && item.task_id === review.id && item.next_action.code === 'REVIEW_AND_ACCEPT'));
+  assert.ok(report.body.blockers.every((item: Record<string, any>) => item.source.kind === 'task_evidence' && item.source.evidence_endpoint === `/tasks/${item.task_id}/evidence`));
   assert.deepEqual((await request('GET', `/projects/${project.id}/delivery-readiness`)).body, report.body);
   assert.equal((await request('GET', '/projects/missing/delivery-readiness')).response.statusCode, 404);
   const script = await app.inject({ method: 'GET', url: '/console.js' });
-  assert.match(script.body, /项目交付就绪度/); assert.match(script.body, /delivery-readiness/); assert.doesNotMatch(script.body, /delivery-readiness.*POST/);
+  assert.match(script.body, /项目交付就绪度/); assert.match(script.body, /查看任务只读证据包/); assert.match(script.body, /delivery-readiness/); assert.doesNotMatch(script.body, /delivery-readiness.*POST/);
   await app.close();
 });
 

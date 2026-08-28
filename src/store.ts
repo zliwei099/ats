@@ -71,6 +71,11 @@ export type DeliveryReadinessBlocker = {
   task_id: string | null;
   title: string | null;
   owner: string | null;
+  source: {
+    kind: 'task_evidence' | 'project';
+    description: string;
+    evidence_endpoint: string | null;
+  };
   facts: Record<string, unknown>;
   next_action: { code: string; condition: string };
 };
@@ -420,7 +425,18 @@ export class Store {
     const tasks = this.db.prepare('SELECT * FROM tasks WHERE project_id=? ORDER BY id').all(projectId) as RecordRow[];
     const blockers: DeliveryReadinessBlocker[] = [];
     const blocker = (code: string, task: RecordRow | null, facts: Record<string, unknown>, next_action: DeliveryReadinessBlocker['next_action']) => {
-      blockers.push({ code, task_id: task ? String(task.id) : null, title: task ? String(task.title) : null, owner: task ? String(task.owner) : null, facts, next_action });
+      const taskId = task ? String(task.id) : null;
+      blockers.push({
+        code,
+        task_id: taskId,
+        title: task ? String(task.title) : null,
+        owner: task ? String(task.owner) : null,
+        source: taskId
+          ? { kind: 'task_evidence', description: 'Derived from this task and its existing read-only evidence package.', evidence_endpoint: `/tasks/${encodeURIComponent(taskId)}/evidence` }
+          : { kind: 'project', description: 'Project-level conclusion with no task source.', evidence_endpoint: null },
+        facts,
+        next_action
+      });
     };
 
     if (!tasks.length) {

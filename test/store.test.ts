@@ -216,8 +216,14 @@ test('delivery readiness derives stable actionable blockers and becomes ready on
   assert.ok(first.blockers.some(item => item.code === 'ACTIVE_EXECUTION' && item.task_id === active.id));
   assert.ok(first.blockers.some(item => item.code === 'INDEPENDENT_VERIFICATION_REQUIRED' && item.task_id === review.id && item.next_action.code === 'REVIEW_AND_ACCEPT'));
   assert.ok(first.blockers.some(item => item.code === 'OVERDUE' && item.task_id === risk.id));
+  for (const item of first.blockers) {
+    assert.equal(item.source.kind, 'task_evidence');
+    assert.equal(item.source.evidence_endpoint, `/tasks/${item.task_id}/evidence`);
+  }
   const empty = store.createProject('empty');
-  assert.deepEqual(store.deliveryReadiness(String(empty.id), now).blockers.map(item => item.code), ['PROJECT_HAS_NO_TASKS']);
+  const emptyReport = store.deliveryReadiness(String(empty.id), now);
+  assert.deepEqual(emptyReport.blockers.map(item => item.code), ['PROJECT_HAS_NO_TASKS']);
+  assert.deepEqual(emptyReport.blockers[0].source, { kind: 'project', description: 'Project-level conclusion with no task source.', evidence_endpoint: null });
   for (const task of [prerequisite, dependent, active, review, risk]) {
     const id = String(task.id); const status = String(store.task(id).status);
     if (status === 'executing') { const execution = store.evidencePackage(id).executions.find(item => item.status === 'active')!; store.finishExecution(String(execution.id)); }

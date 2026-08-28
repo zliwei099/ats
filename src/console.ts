@@ -17,7 +17,7 @@ export const consoleHtml = `<!doctype html>
     section { border: 1px solid #2c3c56; border-radius: 10px; padding: 16px; background: #142038; }
     h2 { font-size: 1.05rem; margin: 0 0 12px; } dl { display: grid; grid-template-columns: max-content 1fr; gap: 7px 16px; margin: 0; } dt { color: #9fb0c6; } dd { margin: 0; overflow-wrap: anywhere; }
     table { border-collapse: collapse; width: 100%; font-size: .92rem; } th, td { border-bottom: 1px solid #2c3c56; text-align: left; padding: 8px; vertical-align: top; overflow-wrap: anywhere; } th { color: #9fb0c6; }
-    code { white-space: pre-wrap; } .empty { color: #9fb0c6; }
+    code { white-space: pre-wrap; } a { color: #9bd1ff; } .empty { color: #9fb0c6; }
     @media (max-width: 600px) { select { min-width: 0; width: 100%; } table { display: block; overflow-x: auto; } }
   </style>
 </head>
@@ -84,7 +84,9 @@ function renderQueue(items) {
 }
 function renderDeliveryReadiness(report) {
   return section('项目交付就绪度（只读）', details([['结论', report.conclusion], ['项目状态', report.project_status], ['已验收任务', report.accepted_task_count], ['未完成任务', report.outstanding_task_count]])
-    + '<h3>阻塞项与下一步</h3>' + rows(report.blockers, [{ label: '代码', key: 'code' }, { label: '任务', html: item => text(item.title) + ' / ' + text(item.task_id) }, { label: '负责人', key: 'owner' }, { label: '事实', html: item => '<code>' + text(JSON.stringify(item.facts)) + '</code>' }, { label: '下一步', html: item => text(item.next_action.code) + '：' + text(item.next_action.condition) }]));
+    + '<h3>阻塞项、证据来源与下一步</h3>' + rows(report.blockers, [{ label: '代码', key: 'code' }, { label: '任务', html: item => text(item.title) + ' / ' + text(item.task_id) }, { label: '负责人', key: 'owner' }, { label: '证据来源', html: item => item.source.kind === 'task_evidence'
+      ? '<a href="/console?taskId=' + encodeURIComponent(item.task_id) + '">查看任务只读证据包</a><br><span class="subtle">' + text(item.source.evidence_endpoint) + '</span>'
+      : '<span class="empty">' + text(item.source.description) + '</span>' }, { label: '事实', html: item => '<code>' + text(JSON.stringify(item.facts)) + '</code>' }, { label: '下一步', html: item => text(item.next_action.code) + '：' + text(item.next_action.condition) }]));
 }
 async function loadEvidence() {
   error.textContent = '';
