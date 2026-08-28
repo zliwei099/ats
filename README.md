@@ -129,7 +129,7 @@ curl -sS http://127.0.0.1:3000/tasks/$task_id/evidence
 
 ## 项目交付就绪度报告
 
-`GET /projects/:projectId/delivery-readiness` 是发布前的只读、可审计概览。它只汇总现有任务、当前计划审批、依赖、执行、验收、负责人和时效风险记录，不会创建审计事件或改变状态。响应的 `conclusion` 为 `ready` 或 `not_ready`；每个 `blockers` 条目都具有稳定的代码、事实、关联任务与负责人，以及可执行的 `next_action`。阻塞项按代码、任务 ID、负责人稳定排序。
+`GET /projects/:projectId/delivery-readiness` 是发布前的只读、可审计概览。它只汇总现有任务、当前计划审批、依赖、执行、验收、负责人和时效风险记录，不会创建审计事件或改变状态。响应的 `conclusion` 为 `ready` 或 `not_ready`；每个 `blockers` 条目都具有稳定的代码、事实、关联任务与负责人，以及可执行的 `next_action`。任务级条目的 `source` 固定为 `task_evidence`，带有既有只读证据包的 `evidence_endpoint`（`/tasks/:taskId/evidence`）；项目级结论（例如空项目）明确以 `source.kind: "project"` 标注无任务来源。阻塞项按代码、任务 ID、负责人稳定排序。
 
 项目中所有任务均已 `accepted` 时，`project_status` 为 `accepted` 且结论为 `ready`；空项目以 `project_status: "empty"` 和 `PROJECT_HAS_NO_TASKS` 明确表示尚不可交付；不存在项目返回 `404 NOT_FOUND`。未完成项目会如实呈现 `PLAN_APPROVAL_REQUIRED`、前置依赖、`ACTIVE_EXECUTION`、`INDEPENDENT_VERIFICATION_REQUIRED`、未完成执行与既有风险代码，绝不推断或写入状态。
 
@@ -140,7 +140,7 @@ curl -sS http://127.0.0.1:3000/projects/$project_id/delivery-readiness
 # 浏览器打开 http://127.0.0.1:3000/console?taskId=$task_id
 ```
 
-控制台会在所选任务的项目概览中展示该报告；它只调用此 GET 端点及既有只读端点，不提供审批、执行、验收、交接或风险处置写入口。
+控制台会在所选任务的项目概览中展示该报告。每条任务级阻塞提供“查看任务只读证据包”链接，跳转到 `/console?taskId=<任务ID>`，并显示其对应的证据 API 路径；项目级无任务来源结论会直接说明。它只调用此 GET 端点及既有只读端点，不提供审批、执行、验收、交接或风险处置写入口。
 
 ## 任务时效风险与升级信号
 
